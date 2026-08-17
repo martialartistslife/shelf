@@ -102,8 +102,9 @@ async def search_cover_by_title(title: str, author: str | None, client: httpx.As
     # Google Books search is centralized so its credential cannot leak into a URL.
     try:
         from app.services import googlebooks
-        candidates.extend(await googlebooks.search_covers(
-            title, author, client, api_key=google_api_key))
+        if google_api_key:
+            candidates.extend(await googlebooks.search_covers(
+                title, author, client, api_key=google_api_key))
     except Exception:
         pass
 

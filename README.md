@@ -75,6 +75,7 @@ CERT_SAN=IP:192.168.1.50,DNS:shelf,DNS:localhost
 | `SECRET_KEY` | *(auto-generated)* | JWT signing key (auto-generated and stored in DB if not set) |
 | `SHELF_ENCRYPTION_KEY` | *(auto-generated)* | Encryption key for stored API credentials. Auto-generated at `data/encryption.key` if not set — never stored in the DB, so backups contain ciphertext only. Set it (e.g. `openssl rand -hex 32`) so the data directory alone can't decrypt credentials |
 | `GOOGLE_BOOKS_API_KEY` | *(unset)* | Optional Google Books API key; overrides the encrypted Settings value |
+| `OPENLIBRARY_CONTACT` | *(unset)* | Contact email for Open Library request identification and its higher identified-client rate limit |
 
 ### Data
 

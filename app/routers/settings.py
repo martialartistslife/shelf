@@ -68,6 +68,8 @@ async def test_google_books(request: Request):
         body = await request.json()
     except Exception:
         return {"ok": False, "message": "Invalid request"}
+    if not isinstance(body, dict):
+        return {"ok": False, "message": "Invalid request"}
     api_key = (body.get("api_key") or "").strip()
     if not api_key:
         with get_db() as db:

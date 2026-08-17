@@ -1,10 +1,11 @@
 """Regression coverage for credentialed Google Books access (all HTTP is mocked)."""
 import asyncio
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 
-from app.services import googlebooks
+from app.services import covers, googlebooks
 
 
 def run(coro):
@@ -76,3 +77,66 @@ def test_malformed_optional_fields_preserve_metadata():
             result = await googlebooks.lookup("isbn", client, api_key="secret")
             assert result["title"] == "Usable"
     run(exercise())
+
+
+def test_cover_search_skips_google_without_key_and_keeps_openlibrary_fallback():
+    async def handler(request):
+        assert request.url.host == "openlibrary.org"
+        return httpx.Response(200, json={"docs": [{"cover_i": 123}]})
+    async def exercise():
+        async with client_for(handler) as client:
+            with patch("app.services.googlebooks.search_covers", AsyncMock()) as google:
+                results = await covers.search_cover_by_title("Dune", "Frank Herbert", client)
+                google.assert_not_awaited()
+                assert results[0]["source"] == "Open Library"
+    run(exercise())
+
+
+def test_cover_search_google_failure_keeps_openlibrary_fallback():
+    async def handler(_request):
+        return httpx.Response(200, json={"docs": [{"cover_i": 123}]})
+    async def exercise():
+        async with client_for(handler) as client:
+            with patch("app.services.googlebooks.search_covers",
+                       AsyncMock(side_effect=googlebooks.GoogleBooksTransportError("down"))) as google:
+                results = await covers.search_cover_by_title(
+                    "Dune", None, client, google_api_key="cover-key")
+            assert google.await_args.kwargs["api_key"] == "cover-key"
+            assert results[0]["source"] == "Open Library"
+    run(exercise())
+
+
+@pytest.mark.parametrize("outcome,expected", [
+    (None, {"ok": True, "message": "Connected to Google Books"}),
+    (googlebooks.GoogleBooksAccessError("Google Books credentials were rejected"),
+     {"ok": False, "message": "Google Books credentials were rejected"}),
+    (googlebooks.GoogleBooksQuotaError("Google Books quota exceeded"),
+     {"ok": False, "message": "Google Books quota exceeded"}),
+    (googlebooks.GoogleBooksTransportError("Google Books connection failed"),
+     {"ok": False, "message": "Google Books connection failed"}),
+    (googlebooks.GoogleBooksMalformedResponse("Google Books returned an invalid response"),
+     {"ok": False, "message": "Google Books returned an invalid response"}),
+])
+def test_connection_results_are_sanitized(outcome, expected):
+    effect = outcome if isinstance(outcome, Exception) else None
+    with patch("app.services.googlebooks._volumes", AsyncMock(side_effect=effect)):
+        result = run(googlebooks.test_connection("sentinel-connection-key"))
+    assert result == expected
+    assert "sentinel-connection-key" not in repr(result)
+
+
+def test_transport_exception_and_url_do_not_expose_key(caplog):
+    sentinel = "sentinel-transport-key"
+    seen_urls = []
+    def handler(request):
+        seen_urls.append(str(request.url))
+        raise httpx.ConnectError("offline", request=request)
+    async def exercise():
+        async with client_for(handler) as client:
+            with pytest.raises(googlebooks.GoogleBooksTransportError) as caught:
+                await googlebooks.lookup("isbn", client, api_key=sentinel)
+        assert sentinel not in repr(caught.value)
+        assert sentinel not in repr(caught.value.__cause__)
+    run(exercise())
+    assert all(sentinel not in url and "key=" not in url for url in seen_urls)
+    assert sentinel not in caplog.text

@@ -23,6 +23,16 @@ class TestGetSetting:
         monkeypatch.setenv("HARDCOVER_TOKEN", "env-token")
         assert get_setting(db, "hardcover_token") == "env-token"
 
+    def test_google_env_override_wins_without_db_row(self, db, monkeypatch):
+        monkeypatch.setenv("GOOGLE_BOOKS_API_KEY", "env-google-key")
+        assert get_setting(db, "google_books_api_key") == "env-google-key"
+        assert get_all_settings(db)["google_books_api_key"] == "env-google-key"
+
+    def test_google_env_override_wins_over_db(self, db, monkeypatch):
+        db.execute("INSERT INTO settings (key, value) VALUES ('google_books_api_key', 'db-key')")
+        monkeypatch.setenv("GOOGLE_BOOKS_API_KEY", "env-google-key")
+        assert get_setting(db, "google_books_api_key") == "env-google-key"
+
     def test_no_env_override_for_unknown_keys(self, db, monkeypatch):
         """Keys not in SECRET_ENV_VARS should not check env."""
         db.execute("INSERT INTO settings (key, value) VALUES ('custom_key', 'db-val')")
