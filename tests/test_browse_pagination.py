@@ -60,6 +60,8 @@ def test_browse_initial_pagination_uses_requested_view(admin_client, db):
 
     response = admin_client.get("/browse", params={"view": "list", "q": "Book"})
     assert response.status_code == 200
+    assert 'data-initial-query="Book"' in response.text
+    assert response.text.count('name="q"') == 1
     assert 'data-browse-view="list"' in response.text
     query = parse_qs(urlparse(_load_more_url(response)).query)
     assert query["q"] == ["Book"]

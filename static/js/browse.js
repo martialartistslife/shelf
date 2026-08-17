@@ -7,11 +7,14 @@ function browsePage() {
         bulkTypeVal: '',
         bulkStatusVal: '',
         filterPills: [],
-        searchQuery: document.querySelector('[name="q"]')?.value || '',
+        searchQuery: '',
         viewMode: localStorage.getItem('shelf-view') || 'grid',
         filtersOpen: false,
 
         init() {
+            // Alpine runs init() before binding :value on the canonical input,
+            // so initialize explicitly from the server-rendered page state.
+            this.syncSearch(this.$root.dataset.initialQuery || '');
             var renderedView = this.$root.dataset.renderedView;
             if (renderedView && renderedView !== this.viewMode) {
                 this.$nextTick(() => this.refreshResults());

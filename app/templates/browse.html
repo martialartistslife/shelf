@@ -1,7 +1,8 @@
 {% extends "base.html" %}
 {% block title %}Browse — Shelf{% endblock %}
 {% block content %}
-<div x-data="browsePage" data-rendered-view="{{ view }}">
+<div x-data="browsePage" data-rendered-view="{{ view }}"
+     data-initial-query="{{ initial_query or '' }}">
     <!-- Bulk Action Bar -->
     <div x-show="selectMode && selectedIds.length > 0" x-transition
          class="fixed bottom-0 inset-x-0 z-40 bg-shelf-card border-t border-shelf-border py-3 px-4 shadow-lg">
