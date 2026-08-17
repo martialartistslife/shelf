@@ -5,8 +5,9 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
+from app.config import COVER_HTTP_TIMEOUT, METADATA_HTTP_TIMEOUT, metadata_provider_order
 from app.routers.items import _lookup_metadata
-from app.services import covers, hardcover, openlibrary
+from app.services import covers, googlebooks, hardcover, openlibrary
 
 
 ISBN = "9780306406157"
@@ -46,6 +47,28 @@ async def test_hardcover_exception_falls_back_to_google():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["openlibrary", "google"])
+async def test_hardcover_enrichment_exception_preserves_primary_metadata(source, monkeypatch):
+    primary = {"title": "Already Valid", "authors": "An Author"}
+    if source == "google":
+        monkeypatch.setenv("METADATA_PROVIDER_ORDER", "google,openlibrary,hardcover")
+    provider_results = {
+        "openlibrary": primary if source == "openlibrary" else None,
+        "google": primary if source == "google" else None,
+    }
+    with patch("app.routers.items.openlibrary.lookup",
+               AsyncMock(return_value=provider_results["openlibrary"])), \
+         patch("app.routers.items.googlebooks.lookup",
+               AsyncMock(return_value=provider_results["google"])), \
+         patch("app.routers.items.hardcover.lookup_by_isbn",
+               AsyncMock(side_effect=RuntimeError("enrichment unavailable"))):
+        metadata, actual_source, hc_ids = await _lookup_metadata(ISBN, "token", AsyncMock())
+    assert metadata == primary
+    assert actual_source == source
+    assert hc_ids == {}
+
+
+@pytest.mark.asyncio
 async def test_all_provider_failures_are_controlled():
     with patch("app.routers.items.openlibrary.lookup", AsyncMock(side_effect=httpx.ConnectError("offline"))), \
          patch("app.routers.items.hardcover.lookup_by_isbn", AsyncMock(side_effect=ValueError("malformed"))), \
@@ -65,6 +88,21 @@ async def test_configured_provider_order_is_honored(monkeypatch):
     google.assert_awaited_once()
     ol.assert_not_awaited()
     hc.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("configured", "expected", "warning"),
+    [
+        ("google,unknown,openlibrary", ("google", "openlibrary"), "unknown providers: unknown"),
+        ("google,openlibrary,google", ("google", "openlibrary"), "duplicate providers: google"),
+    ],
+)
+def test_invalid_provider_order_warns_and_is_deterministic(monkeypatch, caplog,
+                                                           configured, expected, warning):
+    monkeypatch.setenv("METADATA_PROVIDER_ORDER", configured)
+    with caplog.at_level("WARNING", logger="app.config"):
+        assert metadata_provider_order() == expected
+    assert warning in caplog.text
 
 
 @pytest.mark.asyncio
@@ -129,3 +167,94 @@ def test_title_search_provider_exception_does_not_500(admin_client):
                AsyncMock(side_effect=RuntimeError("provider bug"))):
         response = admin_client.get("/api/title-search?q=Dune&media_type=book")
     assert response.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("contact", "expected_interval", "expected_user_agent"),
+    [
+        (None, 1.0, "Shelf/1.0 (self-hosted home library catalog)"),
+        ("ops@example.test", 0.34,
+         "Shelf/1.0 (self-hosted home library catalog; contact: ops@example.test)"),
+    ],
+)
+def test_openlibrary_identification_and_rate(monkeypatch, contact, expected_interval,
+                                             expected_user_agent):
+    if contact is None:
+        monkeypatch.delenv("OPENLIBRARY_CONTACT", raising=False)
+    else:
+        monkeypatch.setenv("OPENLIBRARY_CONTACT", contact)
+    assert openlibrary._request_interval() == expected_interval
+    assert openlibrary._request_headers() == {"User-Agent": expected_user_agent}
+
+
+@pytest.mark.asyncio
+async def test_metadata_timeout_is_applied_to_provider_requests(monkeypatch):
+    seen = []
+
+    async def handler(request):
+        seen.append(request.extensions["timeout"])
+        if request.url.host == "openlibrary.org":
+            return httpx.Response(404)
+        return httpx.Response(200, json={"items": []})
+
+    monkeypatch.setattr(openlibrary, "_rate_limit", AsyncMock())
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        assert await openlibrary.lookup(ISBN, client) is None
+        assert await googlebooks.lookup(ISBN, client) is None
+    expected = {
+        "connect": METADATA_HTTP_TIMEOUT.connect,
+        "read": METADATA_HTTP_TIMEOUT.read,
+        "write": METADATA_HTTP_TIMEOUT.write,
+        "pool": METADATA_HTTP_TIMEOUT.pool,
+    }
+    assert seen == [expected, expected]
+
+
+@pytest.mark.asyncio
+async def test_cover_timeout_is_applied_to_download(tmp_path):
+    seen = []
+
+    async def handler(request):
+        seen.append(request.extensions["timeout"])
+        return httpx.Response(200, content=b"\xff\xd8\xff" + b"x" * 1200)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        assert await covers._download("https://books.google.com/cover.jpg", tmp_path / "cover.jpg", client)
+    assert seen == [{
+        "connect": COVER_HTTP_TIMEOUT.connect,
+        "read": COVER_HTTP_TIMEOUT.read,
+        "write": COVER_HTTP_TIMEOUT.write,
+        "pool": COVER_HTTP_TIMEOUT.pool,
+    }]
+
+
+def test_scan_openlibrary_timeout_hardcover_success(admin_client, db, monkeypatch):
+    monkeypatch.setenv("HARDCOVER_TOKEN", "token")
+    hardcover_meta = {"title": "Hardcover Result", "authors": "HC Author",
+                      "hardcover_book_id": 12, "hardcover_edition_id": 34}
+    with patch("app.routers.items.openlibrary.lookup",
+               AsyncMock(side_effect=httpx.ConnectTimeout("offline"))), \
+         patch("app.routers.items.hardcover.lookup_by_isbn",
+               AsyncMock(return_value=hardcover_meta)), \
+         patch("app.routers.items.googlebooks.lookup", AsyncMock()) as google, \
+         patch("app.routers.items.covers.download_cover", AsyncMock(return_value=None)):
+        response = admin_client.post("/api/scan", data={"isbn": ISBN, "media_type": "book"})
+    assert response.status_code == 200
+    item = db.execute("SELECT title, source FROM items WHERE isbn = ?", (ISBN,)).fetchone()
+    assert dict(item) == {"title": "Hardcover Result", "source": "hardcover"}
+    google.assert_not_awaited()
+
+
+def test_scan_openlibrary_timeout_without_hardcover_uses_google(admin_client, db, monkeypatch):
+    monkeypatch.delenv("HARDCOVER_TOKEN", raising=False)
+    google_meta = {"title": "Google Result", "authors": "GB Author"}
+    with patch("app.routers.items.openlibrary.lookup",
+               AsyncMock(side_effect=httpx.ReadTimeout("offline"))), \
+         patch("app.routers.items.hardcover.lookup_by_isbn", AsyncMock()) as hc, \
+         patch("app.routers.items.googlebooks.lookup", AsyncMock(return_value=google_meta)), \
+         patch("app.routers.items.covers.download_cover", AsyncMock(return_value=None)):
+        response = admin_client.post("/api/scan", data={"isbn": ISBN, "media_type": "book"})
+    assert response.status_code == 200
+    item = db.execute("SELECT title, source FROM items WHERE isbn = ?", (ISBN,)).fetchone()
+    assert dict(item) == {"title": "Google Result", "source": "google"}
+    hc.assert_not_awaited()

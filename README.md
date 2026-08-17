@@ -239,6 +239,9 @@ with `METADATA_CONNECT_TIMEOUT`, `METADATA_READ_TIMEOUT`,
 `METADATA_WRITE_TIMEOUT`, and `METADATA_POOL_TIMEOUT`. Cover requests use the
 shorter `COVER_CONNECT_TIMEOUT` (2 seconds) and `COVER_READ_TIMEOUT`,
 `COVER_WRITE_TIMEOUT`, and `COVER_POOL_TIMEOUT` (4 seconds) settings.
+Set `OPENLIBRARY_CONTACT` to a deployer-controlled email address or URL to
+identify your Shelf instance to Open Library and use its identified-client
+request rate. Without it, Shelf uses Open Library's slower anonymous rate.
 
 ## Optional API Keys
 

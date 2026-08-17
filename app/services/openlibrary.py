@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 
 import httpx
 
@@ -10,10 +11,24 @@ logger = logging.getLogger(__name__)
 _last_request = 0.0
 
 
+def _request_headers() -> dict[str, str]:
+    """Identify Shelf consistently, with an optional deployer contact."""
+    contact = os.environ.get("OPENLIBRARY_CONTACT", "").strip()
+    user_agent = "Shelf/1.0 (self-hosted home library catalog"
+    if contact:
+        user_agent += f"; contact: {contact}"
+    return {"User-Agent": user_agent + ")"}
+
+
+def _request_interval() -> float:
+    """Open Library permits identified clients a higher request rate."""
+    return OPENLIBRARY_RATE_LIMIT if os.environ.get("OPENLIBRARY_CONTACT", "").strip() else 1.0
+
+
 async def _rate_limit():
     global _last_request
     now = asyncio.get_event_loop().time()
-    wait = OPENLIBRARY_RATE_LIMIT - (now - _last_request)
+    wait = _request_interval() - (now - _last_request)
     if wait > 0:
         await asyncio.sleep(wait)
     _last_request = asyncio.get_event_loop().time()
@@ -24,7 +39,7 @@ async def lookup(isbn: str, client: httpx.AsyncClient) -> dict | None:
     await _rate_limit()
     resp = await client.get(
         f"https://openlibrary.org/isbn/{isbn}.json",
-        headers={"User-Agent": "Shelf/1.0 (home library catalog)"},
+        headers=_request_headers(),
         follow_redirects=True,
         timeout=METADATA_HTTP_TIMEOUT,
     )
@@ -117,7 +132,7 @@ async def _fetch_author_name(author_key: str, client: httpx.AsyncClient) -> str 
     await _rate_limit()
     resp = await client.get(
         f"https://openlibrary.org{author_key}.json",
-        headers={"User-Agent": "Shelf/1.0 (home library catalog)"},
+        headers=_request_headers(),
         follow_redirects=True,
         timeout=METADATA_HTTP_TIMEOUT,
     )
@@ -141,7 +156,7 @@ async def _fetch_work(work_key: str, client: httpx.AsyncClient) -> dict | None:
     await _rate_limit()
     resp = await client.get(
         f"https://openlibrary.org{work_key}.json",
-        headers={"User-Agent": "Shelf/1.0 (home library catalog)"},
+        headers=_request_headers(),
         follow_redirects=True,
         timeout=METADATA_HTTP_TIMEOUT,
     )
@@ -155,7 +170,7 @@ async def get_work_description(work_key: str, client: httpx.AsyncClient) -> str 
     await _rate_limit()
     resp = await client.get(
         f"https://openlibrary.org{work_key}.json",
-        headers={"User-Agent": "Shelf/1.0 (home library catalog)"},
+        headers=_request_headers(),
         follow_redirects=True,
         timeout=METADATA_HTTP_TIMEOUT,
     )
@@ -197,7 +212,7 @@ async def _search(params: dict, client: httpx.AsyncClient, limit: int) -> list[d
             # lang=en makes the `editions` subquery surface the best English
             # edition per work, so translations don't win the ISBN pick
             params={**params, "limit": str(limit), "fields": _SEARCH_FIELDS, "lang": "en"},
-            headers={"User-Agent": "Shelf/1.0 (home library catalog)"},
+            headers=_request_headers(),
             timeout=METADATA_HTTP_TIMEOUT,
         )
     except Exception:

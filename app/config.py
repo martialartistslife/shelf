@@ -1,7 +1,10 @@
+import logging
 import os
 from pathlib import Path
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DATABASE_PATH = DATA_DIR / "shelf.db"
@@ -138,6 +141,18 @@ def metadata_provider_order() -> tuple[str, ...]:
     if not raw:
         return default
     requested = tuple(part.strip().lower() for part in raw.split(",") if part.strip())
+    unknown = tuple(dict.fromkeys(part for part in requested if part not in default))
+    duplicates = tuple(dict.fromkeys(part for part in requested if requested.count(part) > 1))
+    if unknown or duplicates:
+        details = []
+        if unknown:
+            details.append(f"unknown providers: {', '.join(unknown)}")
+        if duplicates:
+            details.append(f"duplicate providers: {', '.join(duplicates)}")
+        logger.warning(
+            "Invalid METADATA_PROVIDER_ORDER (%s); using each recognized provider once in first-listed order",
+            "; ".join(details),
+        )
     valid = tuple(dict.fromkeys(part for part in requested if part in default))
     return valid or default
 
