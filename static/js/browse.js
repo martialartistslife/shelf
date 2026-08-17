@@ -7,10 +7,15 @@ function browsePage() {
         bulkTypeVal: '',
         bulkStatusVal: '',
         filterPills: [],
+        searchQuery: document.querySelector('[name="q"]')?.value || '',
         viewMode: localStorage.getItem('shelf-view') || 'grid',
         filtersOpen: false,
 
         init() {
+            var renderedView = this.$root.dataset.renderedView;
+            if (renderedView && renderedView !== this.viewMode) {
+                this.$nextTick(() => this.refreshResults());
+            }
             // Restore sort preference from localStorage (only if no sort in URL)
             var urlSort = new URLSearchParams(window.location.search).get('sort');
             if (!urlSort) {
@@ -76,8 +81,18 @@ function browsePage() {
             this.viewMode = mode;
             localStorage.setItem('shelf-view', mode);
             // Re-trigger search to get correct template
-            var trigger = document.querySelector('[name="media_type_filter"]') || document.querySelector('[name="q"]');
+            this.$nextTick(() => this.refreshResults());
+        },
+
+        refreshResults() {
+            var trigger = document.querySelector('[name="media_type_filter"]');
             if (trigger) htmx.trigger(trigger, 'change');
+        },
+
+        syncSearch(value) {
+            this.searchQuery = value;
+            var canonical = document.querySelector('[name="q"]');
+            if (canonical) canonical.value = value;
         },
 
         syncFilters() {
@@ -123,6 +138,11 @@ function browsePage() {
         },
 
         clearFilter(name) {
+            if (name === 'q') {
+                this.searchQuery = '';
+                this.$nextTick(() => this.refreshResults());
+                return;
+            }
             var el = document.querySelector('[name="' + name + '"]');
             if (el) {
                 el.value = name === 'sort' ? 'newest' : '';
@@ -131,15 +151,15 @@ function browsePage() {
         },
 
         clearAllFilters() {
-            var names = ['q', 'media_type_filter', 'location_filter', 'reading_status', 'owned', 'lent_out', 'tag'];
+            this.searchQuery = '';
+            var names = ['media_type_filter', 'location_filter', 'reading_status', 'owned', 'lent_out', 'tag'];
             names.forEach(function(name) {
                 var el = document.querySelector('[name="' + name + '"]');
                 if (el) el.value = '';
             });
             var sort = document.querySelector('[name="sort"]');
             if (sort) sort.value = 'newest';
-            var trigger = document.querySelector('[name="media_type_filter"]') || document.querySelector('[name="q"]');
-            if (trigger) htmx.trigger(trigger, 'change');
+            this.$nextTick(() => this.refreshResults());
         },
 
         toggleSelectMode() {

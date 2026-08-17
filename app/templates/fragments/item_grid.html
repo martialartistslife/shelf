@@ -1,19 +1,6 @@
 {% if items %}
-<template x-if="viewMode === 'grid'">
-<div class="cover-grid" data-testid="item-grid">
-    {% for item in items %}
-    {% include "fragments/item_card.html" %}
-    {% endfor %}
-    {% if has_more is defined and has_more %}
-    <div id="load-more" class="col-span-full text-center py-4"
-         hx-get="{{ load_more_url }}" hx-trigger="revealed" hx-swap="outerHTML">
-        <div class="inline-block w-6 h-6 border-2 border-shelf-border border-t-shelf-accent rounded-full animate-spin"></div>
-    </div>
-    {% endif %}
-</div>
-</template>
-<template x-if="viewMode === 'list'">
-<div class="overflow-x-auto">
+{% if view == "list" %}
+<div class="overflow-x-auto" data-browse-view="list">
     <table class="w-full text-left">
         <thead>
             <tr class="border-b border-shelf-border text-shelf-muted text-xs uppercase tracking-wider">
@@ -26,20 +13,22 @@
                 <th class="px-3 py-2 hidden sm:table-cell">Status</th>
             </tr>
         </thead>
-        <tbody>
+        <tbody data-testid="item-list">
             {% for item in items %}
             {% include "fragments/item_row.html" %}
             {% endfor %}
+            {% include "fragments/item_rows_sentinel.html" %}
         </tbody>
     </table>
-    {% if has_more is defined and has_more %}
-    <div id="load-more" class="text-center py-4"
-         hx-get="{{ load_more_url }}" hx-trigger="revealed" hx-swap="outerHTML">
-        <div class="inline-block w-6 h-6 border-2 border-shelf-border border-t-shelf-accent rounded-full animate-spin"></div>
-    </div>
-    {% endif %}
 </div>
-</template>
+{% else %}
+<div class="cover-grid" data-testid="item-grid" data-browse-view="grid">
+    {% for item in items %}
+    {% include "fragments/item_card.html" %}
+    {% endfor %}
+    {% include "fragments/item_cards_sentinel.html" %}
+</div>
+{% endif %}
 {% else %}
 <div class="text-center py-20" data-testid="empty-state">
     <svg class="mx-auto mb-4 w-16 h-16 text-shelf-border" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -51,8 +40,7 @@
     </svg>
     {% if has_filters %}
     <p class="text-shelf-muted text-lg mb-2">No items match your filters</p>
-    <button @click="clearAllFilters()"
-            class="text-shelf-accent2 hover:text-shelf-accent inline-block cursor-pointer">Clear all filters</button>
+    <button @click="clearAllFilters()" class="text-shelf-accent2 hover:text-shelf-accent inline-block cursor-pointer">Clear all filters</button>
     {% else %}
     <p class="text-shelf-muted text-lg mb-2">No items found</p>
     <a href="/scan" class="text-shelf-accent2 hover:text-shelf-accent inline-block">Start scanning books</a>

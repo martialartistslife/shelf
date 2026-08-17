@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+from urllib.parse import urlencode
 
 import httpx
 from fastapi import APIRouter, Depends, Request, Form
@@ -28,6 +29,12 @@ SORT_OPTIONS = {
     "year_desc": ("Year (Newest)", "(i.publish_year IS NULL), i.publish_year DESC, i.title COLLATE NOCASE ASC"),
     "year_asc": ("Year (Oldest)", "(i.publish_year IS NULL), i.publish_year ASC, i.title COLLATE NOCASE ASC"),
 }
+
+
+def build_browse_url(**params) -> str:
+    """Build an encoded search URL, omitting only empty filter values."""
+    query = urlencode({key: value for key, value in params.items() if value != ""})
+    return f"/api/search?{query}"
 
 
 def _toast_header(message: str, toast_type: str = "success") -> str:
@@ -796,29 +803,19 @@ async def search_items(
 
     has_more = (offset + per_page) < total
 
-    # Build query string for load-more button
-    qs_parts = []
-    if q:
-        qs_parts.append(f"q={q}")
-    if mt:
-        qs_parts.append(f"media_type_filter={mt}")
-    if loc:
-        qs_parts.append(f"location_filter={loc}")
-    if sort != "newest":
-        qs_parts.append(f"sort={sort}")
-    if reading_status:
-        qs_parts.append(f"reading_status={reading_status}")
-    if owned:
-        qs_parts.append(f"owned={owned}")
-    if lent_out:
-        qs_parts.append(f"lent_out={lent_out}")
-    if tag:
-        from urllib.parse import quote
-        qs_parts.append(f"tag={quote(tag)}")
-    if view:
-        qs_parts.append(f"view={view}")
-    qs_parts.append(f"page={page + 1}")
-    load_more_url = "/api/search?" + "&".join(qs_parts)
+    view = "list" if view == "list" else "grid"
+    load_more_url = build_browse_url(
+        q=q,
+        media_type_filter=mt,
+        location_filter=loc,
+        sort=sort,
+        reading_status=reading_status,
+        owned=owned,
+        lent_out=lent_out,
+        tag=tag,
+        view=view,
+        page=page + 1,
+    )
 
     # Page 1: full grid wrapper. Page 2+: just cards/rows (appended via outerHTML swap on load-more).
     if page <= 1:
@@ -839,6 +836,7 @@ async def search_items(
         "total": total,
         "has_filters": has_filters,
         "seven_days_ago": (datetime.now(tz=None) - timedelta(days=7)).strftime("%Y-%m-%d"),
+        "view": view,
     }
     if filter_counts:
         ctx.update(filter_counts)
