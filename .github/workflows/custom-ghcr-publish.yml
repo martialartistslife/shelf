@@ -1,0 +1,81 @@
+name: Publish custom image to GHCR
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Required immutable/versioned image tag (for example: 0.2.0-custom.1)'
+        required: true
+        type: string
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.reference }}
+      digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Validate requested image tag
+        id: image
+        env:
+          IMAGE_TAG: ${{ inputs.image_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Docker tags are at most 128 characters and may contain only the
+          # characters below. Reject "latest" because custom releases must be
+          # explicitly versioned and must never update a generic floating tag.
+          if [[ ! "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "Invalid Docker image tag: '$IMAGE_TAG'" >&2
+            exit 1
+          fi
+          if [[ "${IMAGE_TAG,,}" == "latest" ]]; then
+            echo "The generic 'latest' tag is not allowed." >&2
+            exit 1
+          fi
+
+          echo "tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+          echo "reference=ghcr.io/martialartistslife/shelf:$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push requested image
+        id: build
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.image.outputs.reference }}
+          cache-from: type=gha,scope=custom-ghcr-amd64
+          cache-to: type=gha,mode=max,scope=custom-ghcr-amd64
+
+      - name: Report published image
+        env:
+          IMAGE: ${{ steps.image.outputs.reference }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo '## Custom Shelf image published'
+            echo
+            echo "- Image: \`$IMAGE\`"
+            echo "- Digest: \`$DIGEST\`"
+            echo "- Pinned reference: \`$IMAGE@$DIGEST\`"
+          } >> "$GITHUB_STEP_SUMMARY"
