@@ -2,6 +2,8 @@ import logging
 
 import httpx
 
+from app.config import METADATA_HTTP_TIMEOUT
+
 logger = logging.getLogger(__name__)
 
 
@@ -10,6 +12,7 @@ async def lookup(isbn: str, client: httpx.AsyncClient) -> dict | None:
     resp = await client.get(
         "https://www.googleapis.com/books/v1/volumes",
         params={"q": f"isbn:{isbn}"},
+        timeout=METADATA_HTTP_TIMEOUT,
     )
     if resp.status_code != 200:
         logger.debug("Google Books lookup failed for ISBN %s: HTTP %d", isbn, resp.status_code)

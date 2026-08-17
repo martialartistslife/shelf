@@ -6,6 +6,9 @@ import time
 
 import httpx
 
+from app.config import METADATA_HTTP_TIMEOUT
+from app.services.isbn import isbn13_to_isbn10
+
 logger = logging.getLogger(__name__)
 
 API_URL = "https://api.hardcover.app/v1/graphql"
@@ -47,7 +50,7 @@ async def _graphql(
     if own_client:
         client = httpx.AsyncClient(timeout=30)
     try:
-        resp = await client.post(API_URL, json=payload, headers=headers)
+        resp = await client.post(API_URL, json=payload, headers=headers, timeout=METADATA_HTTP_TIMEOUT)
         if resp.status_code != 200:
             logger.debug("Hardcover API returned HTTP %d", resp.status_code)
             return None
@@ -108,8 +111,11 @@ async def lookup_by_isbn(isbn: str, client: httpx.AsyncClient, token: str | None
     data = await _graphql(query, {"isbn": isbn}, token=token, client=client)
     if not data or not data.get("editions"):
         # Try as ISBN-10
+        isbn10 = isbn13_to_isbn10(isbn)
+        if not isbn10:
+            return None
         query_10 = query.replace("isbn_13", "isbn_10")
-        data = await _graphql(query_10, {"isbn": isbn}, token=token, client=client)
+        data = await _graphql(query_10, {"isbn": isbn10}, token=token, client=client)
         if not data or not data.get("editions"):
             return None
 

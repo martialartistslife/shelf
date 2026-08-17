@@ -10,7 +10,7 @@ from starlette.responses import StreamingResponse
 from app.auth import require_role
 
 logger = logging.getLogger(__name__)
-from app.config import MEDIA_TYPES, HTTP_TIMEOUT, DEFAULT_PAGE_SIZE
+from app.config import MEDIA_TYPES, HTTP_TIMEOUT, DEFAULT_PAGE_SIZE, metadata_provider_order
 from app.database import get_db, get_setting, get_game_platforms
 from app.services import isbn as isbn_svc
 from app.services import openlibrary, googlebooks, hardcover, covers
@@ -36,31 +36,45 @@ def _toast_header(message: str, toast_type: str = "success") -> str:
 
 async def _lookup_metadata(isbn13: str, hc_token: str | None, client: httpx.AsyncClient) -> tuple[dict | None, str, dict]:
     """Look up book metadata across sources. Returns (metadata, source, hc_ids)."""
-    metadata = await openlibrary.lookup(isbn13, client)
-    if metadata:
-        source = "openlibrary"
-    else:
-        source = "manual"
-
+    metadata = None
+    source = "manual"
     hc_ids = {}
-    if not metadata and hc_token:
-        metadata = await hardcover.lookup_by_isbn(isbn13, client, token=hc_token)
-        if metadata:
-            source = "hardcover"
-            hc_ids = {
-                "hardcover_book_id": metadata.get("hardcover_book_id"),
-                "hardcover_edition_id": metadata.get("hardcover_edition_id"),
-            }
-
-    if not metadata:
-        metadata = await googlebooks.lookup(isbn13, client)
-        if metadata:
-            source = "google"
+    hc_data = None
+    hc_attempted = False
+    providers = {
+        "openlibrary": lambda: openlibrary.lookup(isbn13, client),
+        "hardcover": lambda: hardcover.lookup_by_isbn(isbn13, client, token=hc_token),
+        "google": lambda: googlebooks.lookup(isbn13, client),
+    }
+    for provider in metadata_provider_order():
+        if provider == "hardcover" and not hc_token:
+            continue
+        try:
+            if provider == "hardcover":
+                hc_attempted = True
+            candidate = await providers[provider]()
+            if provider == "hardcover":
+                hc_data = candidate
+            if candidate:
+                metadata = candidate
+                source = provider
+                if provider == "hardcover":
+                    hc_ids = {
+                        "hardcover_book_id": metadata.get("hardcover_book_id"),
+                        "hardcover_edition_id": metadata.get("hardcover_edition_id"),
+                    }
+                break
+        except Exception:
+            logger.warning("%s metadata lookup failed for ISBN %s", provider, isbn13, exc_info=True)
 
     # Enrich with Hardcover data if primary source didn't have series/description
     if metadata and hc_token and source != "hardcover":
         if not metadata.get("series_name") or not metadata.get("description"):
-            hc_data = await hardcover.lookup_by_isbn(isbn13, client, token=hc_token)
+            if not hc_attempted:
+                try:
+                    hc_data = await hardcover.lookup_by_isbn(isbn13, client, token=hc_token)
+                except Exception:
+                    logger.warning("Hardcover enrichment failed for ISBN %s", isbn13, exc_info=True)
             if hc_data:
                 if hc_data.get("series_name") and not metadata.get("series_name"):
                     metadata["series_name"] = hc_data["series_name"]
@@ -1859,7 +1873,11 @@ async def search_books(
         return HTMLResponse("")
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        results = await openlibrary.search_books(q.strip(), client, limit=10)
+        try:
+            results = await openlibrary.search_books(q.strip(), client, limit=10)
+        except Exception:
+            logger.warning("Open Library title search failed for %r", q.strip(), exc_info=True)
+            results = []
 
     return templates.TemplateResponse(
         request, "fragments/book_search_results.html",

@@ -1,5 +1,10 @@
+import logging
 import os
 from pathlib import Path
+
+import httpx
+
+logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DATABASE_PATH = DATA_DIR / "shelf.db"
@@ -102,6 +107,54 @@ HARDCOVER_RATE_LIMIT = 1.0  # seconds between requests (60/min API limit)
 # HTTP client defaults
 HTTP_TIMEOUT = 15  # seconds for external API calls
 DEFAULT_PAGE_SIZE = 60
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a positive timeout value without making a bad env var fatal."""
+    try:
+        value = float(os.environ.get(name, default))
+        return value if value > 0 else default
+    except (TypeError, ValueError):
+        return default
+
+
+# Metadata calls use bounded phase-specific timeouts. Cover fetches are kept
+# shorter because they happen after usable metadata has already been found.
+METADATA_HTTP_TIMEOUT = httpx.Timeout(
+    connect=_env_float("METADATA_CONNECT_TIMEOUT", 3.0),
+    read=_env_float("METADATA_READ_TIMEOUT", 7.0),
+    write=_env_float("METADATA_WRITE_TIMEOUT", 7.0),
+    pool=_env_float("METADATA_POOL_TIMEOUT", 7.0),
+)
+COVER_HTTP_TIMEOUT = httpx.Timeout(
+    connect=_env_float("COVER_CONNECT_TIMEOUT", 2.0),
+    read=_env_float("COVER_READ_TIMEOUT", 4.0),
+    write=_env_float("COVER_WRITE_TIMEOUT", 4.0),
+    pool=_env_float("COVER_POOL_TIMEOUT", 4.0),
+)
+
+
+def metadata_provider_order() -> tuple[str, ...]:
+    """Return the configured, validated metadata provider sequence."""
+    default = ("openlibrary", "hardcover", "google")
+    raw = os.environ.get("METADATA_PROVIDER_ORDER")
+    if not raw:
+        return default
+    requested = tuple(part.strip().lower() for part in raw.split(",") if part.strip())
+    unknown = tuple(dict.fromkeys(part for part in requested if part not in default))
+    duplicates = tuple(dict.fromkeys(part for part in requested if requested.count(part) > 1))
+    if unknown or duplicates:
+        details = []
+        if unknown:
+            details.append(f"unknown providers: {', '.join(unknown)}")
+        if duplicates:
+            details.append(f"duplicate providers: {', '.join(duplicates)}")
+        logger.warning(
+            "Invalid METADATA_PROVIDER_ORDER (%s); using each recognized provider once in first-listed order",
+            "; ".join(details),
+        )
+    valid = tuple(dict.fromkeys(part for part in requested if part in default))
+    return valid or default
 
 # Auth
 SECRET_KEY = os.environ.get("SECRET_KEY", "")  # auto-generated and stored in DB if empty
