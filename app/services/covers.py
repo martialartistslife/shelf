@@ -3,7 +3,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from app.config import COVERS_DIR
+from app.config import COVERS_DIR, COVER_HTTP_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -38,15 +38,20 @@ async def download_cover(item_id: int, isbn: str | None, cover_url: str | None, 
         if await _download(url, dest, client):
             return f"covers/{item_id}.jpg"
 
-    # Try Open Library cover by ISBN
+    # Prefer a successful provider's known image over starting another Open
+    # Library lookup after metadata fallback has already completed.
+    if hardcover_cover_url and is_allowed_cover_url(hardcover_cover_url):
+        if await _download(hardcover_cover_url, dest, client):
+            return f"covers/{item_id}.jpg"
+
+    if cover_url and is_allowed_cover_url(cover_url):
+        if await _download(cover_url, dest, client):
+            return f"covers/{item_id}.jpg"
+
+    # Try Open Library cover by ISBN only when known provider covers failed.
     if isbn:
         url = f"https://covers.openlibrary.org/b/isbn/{isbn}-L.jpg"
         if await _download(url, dest, client):
-            return f"covers/{item_id}.jpg"
-
-    # Try Hardcover cover image
-    if hardcover_cover_url and is_allowed_cover_url(hardcover_cover_url):
-        if await _download(hardcover_cover_url, dest, client):
             return f"covers/{item_id}.jpg"
 
     # Try Amazon product image (reliable for most books, but only for 978-prefix ISBNs)
@@ -56,11 +61,6 @@ async def download_cover(item_id: int, isbn: str | None, cover_url: str | None, 
             url = f"https://images-na.ssl-images-amazon.com/images/P/{isbn10}.01._SCLZZZZZZZ_SX500_.jpg"
             if await _download(url, dest, client):
                 return f"covers/{item_id}.jpg"
-
-    # Try provided cover URL (e.g., from Google Books)
-    if cover_url and is_allowed_cover_url(cover_url):
-        if await _download(cover_url, dest, client):
-            return f"covers/{item_id}.jpg"
 
     return None
 
@@ -182,7 +182,7 @@ async def _download_to_item(item_id: int, url: str, client: httpx.AsyncClient) -
 async def _download(url: str, dest, client: httpx.AsyncClient) -> bool:
     """Download an image URL to dest. Returns True on success."""
     try:
-        resp = await client.get(url, follow_redirects=True)
+        resp = await client.get(url, follow_redirects=True, timeout=COVER_HTTP_TIMEOUT)
         if resp.status_code != 200:
             logger.debug("Cover download failed for %s: HTTP %d", url, resp.status_code)
             return False

@@ -232,6 +232,14 @@ Shelf queries free, public APIs to look up book and game information — no API 
 
 Metadata lookups send only the ISBN or UPC to these services. No personal data, account info, or collection details are transmitted.
 
+For self-hosted deployments, `METADATA_PROVIDER_ORDER` can override the default
+`openlibrary,hardcover,google` sequence. Metadata request phases default to a
+3-second connect timeout and 7-second read/write/pool timeouts; override them
+with `METADATA_CONNECT_TIMEOUT`, `METADATA_READ_TIMEOUT`,
+`METADATA_WRITE_TIMEOUT`, and `METADATA_POOL_TIMEOUT`. Cover requests use the
+shorter `COVER_CONNECT_TIMEOUT` (2 seconds) and `COVER_READ_TIMEOUT`,
+`COVER_WRITE_TIMEOUT`, and `COVER_POOL_TIMEOUT` (4 seconds) settings.
+
 ## Optional API Keys
 
 Configure in Settings to unlock additional features:

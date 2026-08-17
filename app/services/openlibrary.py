@@ -3,7 +3,7 @@ import logging
 
 import httpx
 
-from app.config import OPENLIBRARY_RATE_LIMIT
+from app.config import OPENLIBRARY_RATE_LIMIT, METADATA_HTTP_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +26,7 @@ async def lookup(isbn: str, client: httpx.AsyncClient) -> dict | None:
         f"https://openlibrary.org/isbn/{isbn}.json",
         headers={"User-Agent": "Shelf/1.0 (home library catalog)"},
         follow_redirects=True,
+        timeout=METADATA_HTTP_TIMEOUT,
     )
     if resp.status_code != 200:
         logger.debug("Open Library lookup failed for ISBN %s: HTTP %d", isbn, resp.status_code)
@@ -51,15 +52,29 @@ async def lookup(isbn: str, client: httpx.AsyncClient) -> dict | None:
     if year_match:
         result["publish_year"] = int(year_match.group(1))
 
-    # Get author from works -> author chain
-    author = await _resolve_author(data, client)
-    if author:
-        result["authors"] = author
+    # Edition metadata remains useful even if optional work/author enrichment
+    # is unavailable. Fetch the work at most once for both enrichments.
+    work = None
+    works = data.get("works", [])
+    if works and isinstance(works[0], dict) and works[0].get("key"):
+        try:
+            work = await _fetch_work(works[0]["key"], client)
+        except Exception:
+            logger.debug("Open Library work enrichment failed for ISBN %s", isbn, exc_info=True)
 
-    # Get description from work
-    desc = await _resolve_description(data, client)
-    if desc:
-        result["description"] = desc
+    try:
+        author = await _resolve_author(data, client, work=work)
+        if author:
+            result["authors"] = author
+    except Exception:
+        logger.debug("Open Library author enrichment failed for ISBN %s", isbn, exc_info=True)
+
+    if work:
+        desc = work.get("description")
+        if isinstance(desc, dict):
+            desc = desc.get("value")
+        if desc:
+            result["description"] = desc
 
     # Cover ID for URL construction
     covers = data.get("covers", [])
@@ -69,7 +84,8 @@ async def lookup(isbn: str, client: httpx.AsyncClient) -> dict | None:
     return result
 
 
-async def _resolve_author(edition_data: dict, client: httpx.AsyncClient) -> str | None:
+async def _resolve_author(edition_data: dict, client: httpx.AsyncClient,
+                          work: dict | None = None) -> str | None:
     works = edition_data.get("works", [])
     if not works:
         # Some editions have authors directly
@@ -80,16 +96,8 @@ async def _resolve_author(edition_data: dict, client: httpx.AsyncClient) -> str 
                 return await _fetch_author_name(akey, client)
         return None
 
-    await _rate_limit()
-    work_resp = await client.get(
-        f"https://openlibrary.org{works[0]['key']}.json",
-        headers={"User-Agent": "Shelf/1.0 (home library catalog)"},
-        follow_redirects=True,
-    )
-    if work_resp.status_code != 200:
+    if work is None:
         return None
-
-    work = work_resp.json()
     authors = work.get("authors", [])
     if not authors:
         return None
@@ -111,6 +119,7 @@ async def _fetch_author_name(author_key: str, client: httpx.AsyncClient) -> str 
         f"https://openlibrary.org{author_key}.json",
         headers={"User-Agent": "Shelf/1.0 (home library catalog)"},
         follow_redirects=True,
+        timeout=METADATA_HTTP_TIMEOUT,
     )
     if resp.status_code != 200:
         return None
@@ -127,6 +136,20 @@ async def _resolve_description(edition_data: dict, client: httpx.AsyncClient) ->
     return await get_work_description(works[0]["key"], client)
 
 
+async def _fetch_work(work_key: str, client: httpx.AsyncClient) -> dict | None:
+    """Fetch an Open Library work record."""
+    await _rate_limit()
+    resp = await client.get(
+        f"https://openlibrary.org{work_key}.json",
+        headers={"User-Agent": "Shelf/1.0 (home library catalog)"},
+        follow_redirects=True,
+        timeout=METADATA_HTTP_TIMEOUT,
+    )
+    if resp.status_code != 200:
+        return None
+    return resp.json()
+
+
 async def get_work_description(work_key: str, client: httpx.AsyncClient) -> str | None:
     """Fetch a work record (e.g. '/works/OL27448W') and return its description."""
     await _rate_limit()
@@ -134,6 +157,7 @@ async def get_work_description(work_key: str, client: httpx.AsyncClient) -> str 
         f"https://openlibrary.org{work_key}.json",
         headers={"User-Agent": "Shelf/1.0 (home library catalog)"},
         follow_redirects=True,
+        timeout=METADATA_HTTP_TIMEOUT,
     )
     if resp.status_code != 200:
         return None
@@ -166,19 +190,28 @@ async def search_by_title_author(title: str, author: str | None, client: httpx.A
 
 
 async def _search(params: dict, client: httpx.AsyncClient, limit: int) -> list[dict]:
-    await _rate_limit()
-    resp = await client.get(
-        "https://openlibrary.org/search.json",
-        # lang=en makes the `editions` subquery surface the best English
-        # edition per work, so translations don't win the ISBN pick
-        params={**params, "limit": str(limit), "fields": _SEARCH_FIELDS, "lang": "en"},
-        headers={"User-Agent": "Shelf/1.0 (home library catalog)"},
-    )
+    try:
+        await _rate_limit()
+        resp = await client.get(
+            "https://openlibrary.org/search.json",
+            # lang=en makes the `editions` subquery surface the best English
+            # edition per work, so translations don't win the ISBN pick
+            params={**params, "limit": str(limit), "fields": _SEARCH_FIELDS, "lang": "en"},
+            headers={"User-Agent": "Shelf/1.0 (home library catalog)"},
+            timeout=METADATA_HTTP_TIMEOUT,
+        )
+    except Exception:
+        logger.warning("Open Library search request failed for %r", params, exc_info=True)
+        return []
     if resp.status_code != 200:
         logger.debug("Open Library search failed for %r: HTTP %d", params, resp.status_code)
         return []
 
-    docs = resp.json().get("docs", [])
+    try:
+        docs = resp.json().get("docs", [])
+    except (TypeError, ValueError):
+        logger.warning("Open Library search returned malformed JSON for %r", params)
+        return []
     results = []
     for doc in docs:
         title = doc.get("title")
