@@ -231,6 +231,26 @@ document.addEventListener('alpine:init', function () {
         };
     });
 
+    Alpine.data('googleBooksPanel', function () {
+        return {
+            apiKey: '', testing: false, status: null,
+            saved: false,
+            init() { this.saved = this.$root.dataset.googleSaved === '1'; },
+            async testGoogle() {
+                this.testing = true; this.status = null;
+                try {
+                    const response = await fetch('/api/settings/google-books/test', {
+                        method: 'POST', headers: {'Content-Type': 'application/json',
+                            'X-CSRF-Token': window.csrfToken()},
+                        body: JSON.stringify({api_key: this.apiKey})
+                    });
+                    this.status = await response.json();
+                } catch (_) { this.status = {ok: false, message: 'Connection test failed'}; }
+                this.testing = false;
+            }
+        };
+    });
+
     // settings.html — Collection Valuation card (ISBNdb)
     Alpine.data('valuationPanel', function () {
         return {

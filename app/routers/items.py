@@ -41,7 +41,8 @@ def _toast_header(message: str, toast_type: str = "success") -> str:
     return json.dumps({"showToast": {"message": message, "type": toast_type}})
 
 
-async def _lookup_metadata(isbn13: str, hc_token: str | None, client: httpx.AsyncClient) -> tuple[dict | None, str, dict]:
+async def _lookup_metadata(isbn13: str, hc_token: str | None, client: httpx.AsyncClient,
+                           google_api_key: str | None = None) -> tuple[dict | None, str, dict]:
     """Look up book metadata across sources. Returns (metadata, source, hc_ids)."""
     metadata = None
     source = "manual"
@@ -51,10 +52,12 @@ async def _lookup_metadata(isbn13: str, hc_token: str | None, client: httpx.Asyn
     providers = {
         "openlibrary": lambda: openlibrary.lookup(isbn13, client),
         "hardcover": lambda: hardcover.lookup_by_isbn(isbn13, client, token=hc_token),
-        "google": lambda: googlebooks.lookup(isbn13, client),
+        "google": lambda: googlebooks.lookup(isbn13, client, api_key=google_api_key),
     }
     for provider in metadata_provider_order():
         if provider == "hardcover" and not hc_token:
+            continue
+        if provider == "google" and not google_api_key:
             continue
         try:
             if provider == "hardcover":
@@ -429,11 +432,12 @@ async def scan_isbn(
     # Get Hardcover token for metadata enrichment
     with get_db() as db:
         hc_token = get_setting(db, "hardcover_token") or None
+        google_api_key = get_setting(db, "google_books_api_key") or None
 
     logger.info("Scanning ISBN %s (type=%s, mode=%s)", isbn13, media_type, mode)
     try:
         async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            metadata, source, hc_ids = await _lookup_metadata(isbn13, hc_token, client)
+            metadata, source, hc_ids = await _lookup_metadata(isbn13, hc_token, client, google_api_key)
 
             if not metadata:
                 preview_cover = await _fetch_preview_cover(isbn13, client)
@@ -1061,11 +1065,13 @@ async def cover_search(request: Request, item_id: int, _=Depends(require_role("e
     templates = request.app.state.templates
     with get_db() as db:
         item = db.execute("SELECT title, authors FROM items WHERE id = ?", (item_id,)).fetchone()
+        google_api_key = get_setting(db, "google_books_api_key") or None
     if not item:
         return HTMLResponse("Not found", status_code=404)
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        candidates = await covers.search_cover_by_title(item["title"], item["authors"], client)
+        candidates = await covers.search_cover_by_title(
+            item["title"], item["authors"], client, google_api_key=google_api_key)
 
     return templates.TemplateResponse(
         request, "fragments/cover_search.html",
@@ -1178,12 +1184,14 @@ async def fetch_synopsis(item_id: int, _=Depends(require_role("editor"))):
             "SELECT isbn, title, authors FROM items WHERE id = ?", (item_id,)
         ).fetchone()
         hc_token = get_setting(db, "hardcover_token")
+        google_api_key = get_setting(db, "google_books_api_key") or None
     if not item:
         return {"ok": False, "message": "Item not found"}
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         desc = await synopsis_svc.fetch_description(
-            item["isbn"], item["title"], item["authors"], client, hc_token=hc_token)
+            item["isbn"], item["title"], item["authors"], client, hc_token=hc_token,
+            google_api_key=google_api_key)
 
     if desc:
         with get_db() as db:
@@ -1207,6 +1215,7 @@ async def backfill_synopses_stream(request: Request, _=Depends(require_role("adm
             synopsis_svc.BOOK_MEDIA_TYPES,
         ).fetchall()
         hc_token = get_setting(db, "hardcover_token")
+        google_api_key = get_setting(db, "google_books_api_key") or None
 
     if not items:
         async def empty_stream():
@@ -1224,7 +1233,7 @@ async def backfill_synopses_stream(request: Request, _=Depends(require_role("adm
                     try:
                         desc = await synopsis_svc.fetch_description(
                             item["isbn"], item["title"], item["authors"], client,
-                            hc_token=hc_token)
+                            hc_token=hc_token, google_api_key=google_api_key)
                     except Exception:
                         logger.exception("Synopsis fetch failed for item %d", item["id"])
                     if desc:
@@ -1915,9 +1924,10 @@ async def add_book_from_search(
 
     with get_db() as db:
         hc_token = get_setting(db, "hardcover_token") or None
+        google_api_key = get_setting(db, "google_books_api_key") or None
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        metadata, source, hc_ids = await _lookup_metadata(isbn13, hc_token, client)
+        metadata, source, hc_ids = await _lookup_metadata(isbn13, hc_token, client, google_api_key)
 
         if not metadata:
             _log_scan(isbn13, media_type, "not_found")

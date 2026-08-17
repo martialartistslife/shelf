@@ -64,7 +64,8 @@ def _result_ok(authors: str | None, query_title: str, res: dict) -> bool:
 
 
 async def fetch_description(isbn: str | None, title: str | None, authors: str | None,
-                            client: httpx.AsyncClient, hc_token: str | None = None) -> str | None:
+                            client: httpx.AsyncClient, hc_token: str | None = None,
+                            google_api_key: str | None = None) -> str | None:
     """Find a description via Google Books (ISBN), then Hardcover (when a
     token is configured), then Open Library work search, then Google Books
     title/author search. Returns None if nothing credible is found.
@@ -72,12 +73,17 @@ async def fetch_description(isbn: str | None, title: str | None, authors: str | 
     Hardcover sits early in the chain because Google Books' anonymous quota
     is per-IP and exhausts under bulk backfills, and Open Library work
     records are frequently description-less even when the search matches."""
-    if isbn:
+    google_hard_failure = False
+    if isbn and google_api_key:
         try:
-            meta = await googlebooks.lookup(isbn, client)
+            meta = await googlebooks.lookup(isbn, client, api_key=google_api_key)
             if meta and meta.get("description"):
                 return meta["description"]
-        except httpx.HTTPError:
+        except (googlebooks.GoogleBooksAccessError, googlebooks.GoogleBooksQuotaError,
+                googlebooks.GoogleBooksTransportError):
+            google_hard_failure = True
+            logger.debug("Google Books ISBN lookup unavailable for %s", isbn)
+        except (httpx.HTTPError, googlebooks.GoogleBooksError):
             logger.debug("Google Books ISBN lookup failed for %s", isbn)
 
     if not title:
@@ -108,12 +114,15 @@ async def fetch_description(isbn: str | None, title: str | None, authors: str | 
     except httpx.HTTPError:
         logger.debug("Open Library synopsis search failed for %r", title)
 
+    if google_hard_failure or not google_api_key:
+        return None
     try:
-        results = await googlebooks.search_by_title_author(search_title, first_author, client)
+        results = await googlebooks.search_by_title_author(
+            search_title, first_author, client, api_key=google_api_key)
         for res in results:
             if _result_ok(authors, search_title, res) and res.get("description"):
                 return res["description"]
-    except httpx.HTTPError:
+    except (httpx.HTTPError, googlebooks.GoogleBooksError):
         logger.debug("Google Books synopsis search failed for %r", title)
 
     return None

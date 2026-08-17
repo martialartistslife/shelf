@@ -94,32 +94,16 @@ def save_uploaded_cover(item_id: int, content: bytes) -> str | None:
     return f"covers/{item_id}.jpg"
 
 
-async def search_cover_by_title(title: str, author: str | None, client: httpx.AsyncClient) -> list[dict]:
+async def search_cover_by_title(title: str, author: str | None, client: httpx.AsyncClient,
+                                google_api_key: str | None = None) -> list[dict]:
     """Search for cover candidates by title/author. Returns list of {url, source, thumbnail}."""
     candidates = []
 
-    # Google Books search
+    # Google Books search is centralized so its credential cannot leak into a URL.
     try:
-        q = title
-        if author:
-            q += f"+inauthor:{author.split(',')[0].split('&')[0].strip()}"
-        resp = await client.get(
-            "https://www.googleapis.com/books/v1/volumes",
-            params={"q": q, "maxResults": "5"},
-            timeout=10,
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            for item in data.get("items", []):
-                images = item.get("volumeInfo", {}).get("imageLinks", {})
-                thumb = images.get("thumbnail") or images.get("smallThumbnail")
-                large = images.get("large") or images.get("medium") or thumb
-                if thumb:
-                    candidates.append({
-                        "url": large.replace("http://", "https://"),
-                        "thumbnail": thumb.replace("http://", "https://"),
-                        "source": "Google Books",
-                    })
+        from app.services import googlebooks
+        candidates.extend(await googlebooks.search_covers(
+            title, author, client, api_key=google_api_key))
     except Exception:
         pass
 

@@ -61,6 +61,7 @@ CERT_SAN=IP:192.168.1.100,DNS:shelf,DNS:localhost
 | `SECRET_KEY` | *(auto-generated)* | JWT signing key for auth tokens. Auto-generated and stored in the database if not set. Set this explicitly if running multiple instances |
 | `SHELF_ENCRYPTION_KEY` | *(auto-generated)* | Encryption key for stored API credentials. Auto-generated at `/data/encryption.key` if not set. Set it explicitly (e.g. `openssl rand -hex 32`) so the data directory alone can't decrypt credentials |
 | `SHELF_TRUST_PROXY` | *(unset)* | Set to `1` when running behind a reverse proxy so client IPs are read from proxy headers |
+| `GOOGLE_BOOKS_API_KEY` | *(unset)* | Optional Google Books API key; overrides the encrypted Settings value |
 
 ## Persistent Data
 
