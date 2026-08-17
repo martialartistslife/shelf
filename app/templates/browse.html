@@ -1,7 +1,8 @@
 {% extends "base.html" %}
 {% block title %}Browse — Shelf{% endblock %}
 {% block content %}
-<div x-data="browsePage">
+<div x-data="browsePage" data-rendered-view="{{ view }}"
+     data-initial-query="{{ initial_query or '' }}">
     <!-- Bulk Action Bar -->
     <div x-show="selectMode && selectedIds.length > 0" x-transition
          class="fixed bottom-0 inset-x-0 z-40 bg-shelf-card border-t border-shelf-border py-3 px-4 shadow-lg">
@@ -82,16 +83,16 @@
                 <span x-show="filterPills.length > 0" class="bg-shelf-accent text-white text-[10px] rounded-full w-4 h-4 flex items-center justify-center" x-text="filterPills.length"></span>
             </button>
             <!-- Search always visible on mobile -->
-            <input type="search" name="q" data-testid="search-input" placeholder="Search..." value="{{ initial_query or '' }}"
+            <input type="search" data-browse-search data-testid="search-input" placeholder="Search..." x-model="searchQuery" @input="syncSearch($event.target.value)"
                    hx-get="/api/search" hx-trigger="keyup changed delay:300ms" hx-target="#item-grid"
-                   hx-include="[name='media_type_filter'],[name='location_filter'],[name='sort'],[name='reading_status'],[name='owned'],[name='lent_out'],[name='tag'],[name='view']"
+                   hx-include="[name='q'],[name='media_type_filter'],[name='location_filter'],[name='sort'],[name='reading_status'],[name='owned'],[name='lent_out'],[name='tag'],[name='view']"
                    class="bg-shelf-card border border-shelf-border rounded-lg px-3 py-2 text-sm text-shelf-text focus:ring-2 focus:ring-shelf-accent focus:border-transparent outline-none placeholder-shelf-muted/50 flex-1 min-w-0">
         </div>
         <div :class="filtersOpen ? 'flex' : 'hidden sm:flex'" class="flex-wrap items-center gap-3">
             <!-- Search (hidden on mobile since it's shown above) -->
-            <input type="search" name="q" data-testid="search-input" placeholder="Search..." value="{{ initial_query or '' }}"
+            <input type="search" data-browse-search data-testid="search-input" placeholder="Search..." x-model="searchQuery" @input="syncSearch($event.target.value)"
                    hx-get="/api/search" hx-trigger="keyup changed delay:300ms" hx-target="#item-grid"
-                   hx-include="[name='media_type_filter'],[name='location_filter'],[name='sort'],[name='reading_status'],[name='owned'],[name='lent_out'],[name='tag'],[name='view']"
+                   hx-include="[name='q'],[name='media_type_filter'],[name='location_filter'],[name='sort'],[name='reading_status'],[name='owned'],[name='lent_out'],[name='tag'],[name='view']"
                    class="hidden sm:block bg-shelf-card border border-shelf-border rounded-lg px-3 py-2 text-sm text-shelf-text focus:ring-2 focus:ring-shelf-accent focus:border-transparent outline-none placeholder-shelf-muted/50 w-48">
 
             {% set f = initial_filters or {} %}
@@ -192,7 +193,8 @@
         <button @click="clearAllFilters()" class="text-xs text-shelf-muted hover:text-shelf-error transition-colors ml-1">Clear all</button>
     </div>
 
-    <!-- Hidden view mode input for HTMX requests -->
+    <!-- Canonical values submitted by every HTMX control. -->
+    <input type="hidden" name="q" :value="searchQuery">
     <input type="hidden" name="view" :value="viewMode">
 
     <!-- Item Grid -->

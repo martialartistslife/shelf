@@ -1,13 +1,11 @@
 from datetime import date, datetime, timedelta
-from urllib.parse import quote
-
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import RedirectResponse
 
 from app.auth import require_role
 from app.config import MEDIA_TYPES, DEFAULT_PAGE_SIZE
 from app.database import get_db, get_setting, get_game_platforms
-from app.routers.items import SORT_OPTIONS
+from app.routers.items import SORT_OPTIONS, build_browse_url
 
 router = APIRouter()
 
@@ -28,6 +26,7 @@ async def browse(
     owned: str = "",
     lent_out: str = "",
     tag: str = "",
+    view: str = "grid",
     _=Depends(require_role("viewer")),
 ):
     with get_db() as db:
@@ -120,26 +119,19 @@ async def browse(
 
         has_more = len(items) < total_filtered
 
-        # Build load-more URL preserving filters
-        qs_parts = []
-        if q:
-            qs_parts.append(f"q={q}")
-        if media_type_filter:
-            qs_parts.append(f"media_type_filter={media_type_filter}")
-        if location_filter:
-            qs_parts.append(f"location_filter={location_filter}")
-        if sort != "newest":
-            qs_parts.append(f"sort={sort}")
-        if reading_status:
-            qs_parts.append(f"reading_status={reading_status}")
-        if owned:
-            qs_parts.append(f"owned={owned}")
-        if lent_out:
-            qs_parts.append(f"lent_out={lent_out}")
-        if tag:
-            qs_parts.append(f"tag={quote(tag)}")
-        qs_parts.append("page=2")
-        load_more_url = "/api/search?" + "&".join(qs_parts)
+        view = "list" if view == "list" else "grid"
+        load_more_url = build_browse_url(
+            q=q,
+            media_type_filter=media_type_filter,
+            location_filter=location_filter,
+            sort=sort,
+            reading_status=reading_status,
+            owned=owned,
+            lent_out=lent_out,
+            tag=tag,
+            view=view,
+            page=2,
+        )
 
     return request.app.state.templates.TemplateResponse(
         request,
@@ -160,6 +152,7 @@ async def browse(
             "has_more": has_more,
             "has_filters": any([q, media_type_filter, location_filter, reading_status, owned, lent_out, tag]),
             "load_more_url": load_more_url,
+            "view": view,
             "seven_days_ago": (datetime.now(tz=None) - timedelta(days=7)).strftime("%Y-%m-%d"),
             "initial_query": q,
             "initial_filters": {
