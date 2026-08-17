@@ -11,6 +11,7 @@ from app.services import covers, googlebooks, hardcover, openlibrary
 
 
 ISBN = "9780306406157"
+GOOGLE_KEY = "test-google-key"
 META = {"title": "Fallback Book", "cover_url": "https://books.google.com/cover.jpg"}
 
 
@@ -32,9 +33,33 @@ async def test_timeout_without_hardcover_token_falls_back_to_google():
     with patch("app.routers.items.openlibrary.lookup", AsyncMock(side_effect=httpx.ReadTimeout("slow"))), \
          patch("app.routers.items.hardcover.lookup_by_isbn", AsyncMock()) as hc, \
          patch("app.routers.items.googlebooks.lookup", AsyncMock(return_value=META)):
-        metadata, source, _ = await _lookup_metadata(ISBN, None, AsyncMock())
+        metadata, source, _ = await _lookup_metadata(ISBN, None, AsyncMock(), GOOGLE_KEY)
     assert (metadata, source) == (META, "google")
     hc.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_lookup_skips_google_without_key():
+    with patch("app.routers.items.openlibrary.lookup", AsyncMock(return_value=None)), \
+         patch("app.routers.items.googlebooks.lookup", AsyncMock()) as google:
+        assert await _lookup_metadata(ISBN, None, AsyncMock()) == (None, "manual", {})
+    google.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [
+    googlebooks.GoogleBooksAccessError("access"),
+    googlebooks.GoogleBooksQuotaError("quota"),
+    googlebooks.GoogleBooksMalformedResponse("malformed"),
+    googlebooks.GoogleBooksTransportError("transport"),
+])
+async def test_google_failure_does_not_block_later_provider(monkeypatch, failure):
+    monkeypatch.setenv("METADATA_PROVIDER_ORDER", "google,openlibrary,hardcover")
+    with patch("app.routers.items.googlebooks.lookup", AsyncMock(side_effect=failure)), \
+         patch("app.routers.items.openlibrary.lookup", AsyncMock(return_value=META)) as ol:
+        metadata, source, _ = await _lookup_metadata(ISBN, None, AsyncMock(), GOOGLE_KEY)
+    assert (metadata, source) == (META, "openlibrary")
+    ol.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -42,7 +67,7 @@ async def test_hardcover_exception_falls_back_to_google():
     with patch("app.routers.items.openlibrary.lookup", AsyncMock(return_value=None)), \
          patch("app.routers.items.hardcover.lookup_by_isbn", AsyncMock(side_effect=ValueError("bad response"))), \
          patch("app.routers.items.googlebooks.lookup", AsyncMock(return_value=META)):
-        metadata, source, _ = await _lookup_metadata(ISBN, "token", AsyncMock())
+        metadata, source, _ = await _lookup_metadata(ISBN, "token", AsyncMock(), GOOGLE_KEY)
     assert (metadata, source) == (META, "google")
 
 
@@ -62,7 +87,8 @@ async def test_hardcover_enrichment_exception_preserves_primary_metadata(source,
                AsyncMock(return_value=provider_results["google"])), \
          patch("app.routers.items.hardcover.lookup_by_isbn",
                AsyncMock(side_effect=RuntimeError("enrichment unavailable"))):
-        metadata, actual_source, hc_ids = await _lookup_metadata(ISBN, "token", AsyncMock())
+        metadata, actual_source, hc_ids = await _lookup_metadata(
+            ISBN, "token", AsyncMock(), GOOGLE_KEY if source == "google" else None)
     assert metadata == primary
     assert actual_source == source
     assert hc_ids == {}
@@ -73,7 +99,7 @@ async def test_all_provider_failures_are_controlled():
     with patch("app.routers.items.openlibrary.lookup", AsyncMock(side_effect=httpx.ConnectError("offline"))), \
          patch("app.routers.items.hardcover.lookup_by_isbn", AsyncMock(side_effect=ValueError("malformed"))), \
          patch("app.routers.items.googlebooks.lookup", AsyncMock(side_effect=RuntimeError("broken"))):
-        assert await _lookup_metadata(ISBN, "token", AsyncMock()) == (None, "manual", {})
+        assert await _lookup_metadata(ISBN, "token", AsyncMock(), GOOGLE_KEY) == (None, "manual", {})
 
 
 @pytest.mark.asyncio
@@ -83,7 +109,7 @@ async def test_configured_provider_order_is_honored(monkeypatch):
     with patch("app.routers.items.googlebooks.lookup", AsyncMock(return_value=complete_meta)) as google, \
          patch("app.routers.items.openlibrary.lookup", AsyncMock()) as ol, \
          patch("app.routers.items.hardcover.lookup_by_isbn", AsyncMock()) as hc:
-        _, source, _ = await _lookup_metadata(ISBN, "token", AsyncMock())
+        _, source, _ = await _lookup_metadata(ISBN, "token", AsyncMock(), GOOGLE_KEY)
     assert source == "google"
     google.assert_awaited_once()
     ol.assert_not_awaited()
@@ -200,7 +226,7 @@ async def test_metadata_timeout_is_applied_to_provider_requests(monkeypatch):
     monkeypatch.setattr(openlibrary, "_rate_limit", AsyncMock())
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         assert await openlibrary.lookup(ISBN, client) is None
-        assert await googlebooks.lookup(ISBN, client) is None
+        assert await googlebooks.lookup(ISBN, client, api_key=GOOGLE_KEY) is None
     expected = {
         "connect": METADATA_HTTP_TIMEOUT.connect,
         "read": METADATA_HTTP_TIMEOUT.read,
@@ -247,14 +273,26 @@ def test_scan_openlibrary_timeout_hardcover_success(admin_client, db, monkeypatc
 
 def test_scan_openlibrary_timeout_without_hardcover_uses_google(admin_client, db, monkeypatch):
     monkeypatch.delenv("HARDCOVER_TOKEN", raising=False)
+    monkeypatch.setenv("GOOGLE_BOOKS_API_KEY", GOOGLE_KEY)
     google_meta = {"title": "Google Result", "authors": "GB Author"}
     with patch("app.routers.items.openlibrary.lookup",
                AsyncMock(side_effect=httpx.ReadTimeout("offline"))), \
          patch("app.routers.items.hardcover.lookup_by_isbn", AsyncMock()) as hc, \
-         patch("app.routers.items.googlebooks.lookup", AsyncMock(return_value=google_meta)), \
+         patch("app.routers.items.googlebooks.lookup", AsyncMock(return_value=google_meta)) as google, \
          patch("app.routers.items.covers.download_cover", AsyncMock(return_value=None)):
         response = admin_client.post("/api/scan", data={"isbn": ISBN, "media_type": "book"})
     assert response.status_code == 200
     item = db.execute("SELECT title, source FROM items WHERE isbn = ?", (ISBN,)).fetchone()
     assert dict(item) == {"title": "Google Result", "source": "google"}
     hc.assert_not_awaited()
+    assert google.await_args.kwargs["api_key"] == GOOGLE_KEY
+
+
+def test_add_from_search_passes_google_key(admin_client, monkeypatch):
+    monkeypatch.setenv("GOOGLE_BOOKS_API_KEY", GOOGLE_KEY)
+    with patch("app.routers.items._lookup_metadata",
+               AsyncMock(return_value=(META, "google", {}))) as lookup, \
+         patch("app.routers.items.covers.download_cover", AsyncMock(return_value=None)):
+        response = admin_client.post("/api/books/add", data={"isbn": ISBN, "media_type": "book"})
+    assert response.status_code == 200
+    assert lookup.await_args.args[3] == GOOGLE_KEY

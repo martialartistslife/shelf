@@ -283,7 +283,11 @@ def get_all_settings(db) -> dict[str, str]:
         if val and r["key"] in SENSITIVE_KEYS:
             val = decrypt_value(val, secret)
         settings[r["key"]] = val
-    return {k: get_setting_value(k, v) for k, v in settings.items()}
+    # Include environment-only credentials even when the setting has never
+    # been persisted (environment overrides must not require a placeholder row).
+    from app.config import SECRET_ENV_VARS
+    return {k: get_setting_value(k, settings.get(k))
+            for k in settings.keys() | SECRET_ENV_VARS.keys()}
 
 
 def get_game_platforms(db) -> dict[str, str]:

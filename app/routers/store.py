@@ -103,6 +103,7 @@ async def store_queue(request: Request, _=Depends(require_role("editor"))):
 
     with get_db() as db:
         hc_token = get_setting(db, "hardcover_token") or None
+        google_api_key = get_setting(db, "google_books_api_key") or None
 
     results = []
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
@@ -126,7 +127,8 @@ async def store_queue(request: Request, _=Depends(require_role("editor"))):
 
             metadata, source, hc_ids = None, None, {}
             try:
-                metadata, source, hc_ids = await _lookup_metadata(isbn13, hc_token, client)
+                metadata, source, hc_ids = await _lookup_metadata(
+                    isbn13, hc_token, client, google_api_key)
             except Exception:
                 logger.warning("Store queue: metadata lookup failed for %s", isbn13)
 

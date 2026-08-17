@@ -7,6 +7,7 @@ from app.auth import require_role
 from app.config import DATABASE_PATH, DATA_DIR
 from app.crypto import SENSITIVE_KEYS, encrypt_value, get_encryption_key
 from app.database import get_db
+from app.database import get_setting
 
 router = APIRouter(prefix="/api/settings", dependencies=[Depends(require_role("admin"))])
 
@@ -16,6 +17,7 @@ _INTEGRATION_KEYS = (
     "isbndb_api_key",
     "tmdb_api_key",
     "hardcover_token",
+    "google_books_api_key",
     "igdb_client_id",
     "igdb_client_secret",
 )
@@ -56,6 +58,25 @@ async def update_settings(request: Request):
                 value = value.rstrip("/")
             _upsert_setting(db, key, value, cleared=form.get(f"clear_{key}") == "on")
     return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/google-books/test")
+async def test_google_books(request: Request):
+    """Test the submitted or saved key; service messages never contain it."""
+    from app.services import googlebooks
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": False, "message": "Invalid request"}
+    if not isinstance(body, dict):
+        return {"ok": False, "message": "Invalid request"}
+    api_key = (body.get("api_key") or "").strip()
+    if not api_key:
+        with get_db() as db:
+            api_key = get_setting(db, "google_books_api_key")
+    if not api_key:
+        return {"ok": False, "message": "No API key configured"}
+    return await googlebooks.test_connection(api_key)
 
 
 @router.post("/vision")

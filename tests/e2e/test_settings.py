@@ -12,6 +12,19 @@ def test_settings_page_loads(live_server, authed_page):
     expect(authed_page.locator("body")).to_contain_text("Settings")
 
 
+def test_google_books_key_is_write_only_and_csp_component_loads(live_server, authed_page):
+    sentinel = "e2e-sentinel-google-key"
+    authed_page.goto(f"{live_server['url']}/settings")
+    field = authed_page.locator('input[name="google_books_api_key"]')
+    field.fill(sentinel)
+    field.locator("xpath=ancestor::form").get_by_role("button", name="Save").click()
+    authed_page.wait_for_url(f"{live_server['url']}/settings")
+
+    expect(field).to_have_value("")
+    assert sentinel not in authed_page.content()
+    expect(field).to_have_attribute("placeholder", "Saved — leave blank to keep")
+
+
 def test_stats_page_loads(live_server, authed_page):
     """Stats page renders without error."""
     authed_page.goto(f"{live_server['url']}/stats")

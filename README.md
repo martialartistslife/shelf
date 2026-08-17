@@ -74,6 +74,8 @@ CERT_SAN=IP:192.168.1.50,DNS:shelf,DNS:localhost
 | `CERT_SAN` | `DNS:shelf,DNS:localhost` | TLS certificate Subject Alternative Names |
 | `SECRET_KEY` | *(auto-generated)* | JWT signing key (auto-generated and stored in DB if not set) |
 | `SHELF_ENCRYPTION_KEY` | *(auto-generated)* | Encryption key for stored API credentials. Auto-generated at `data/encryption.key` if not set — never stored in the DB, so backups contain ciphertext only. Set it (e.g. `openssl rand -hex 32`) so the data directory alone can't decrypt credentials |
+| `GOOGLE_BOOKS_API_KEY` | *(unset)* | Optional Google Books API key; overrides the encrypted Settings value |
+| `OPENLIBRARY_CONTACT` | *(unset)* | Contact email for Open Library request identification and its higher identified-client rate limit |
 
 ### Data
 
@@ -226,7 +228,7 @@ Shelf queries free, public APIs to look up book and game information — no API 
 | Source | What it provides | API key required? |
 |--------|-----------------|-------------------|
 | [Open Library](https://openlibrary.org) | Title, author, description, cover art, publish info, title search | No |
-| [Google Books](https://books.google.com) | Fallback metadata and cover art | No |
+| [Google Books](https://books.google.com) | Fallback metadata and cover art | Google Books API key |
 | [Amazon Images](https://www.amazon.com) | Fallback cover art via ISBN | No |
 | [UPC Item DB](https://www.upcitemdb.com) | Title lookup from UPC barcodes (games, DVDs) | No |
 
