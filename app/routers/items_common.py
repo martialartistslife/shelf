@@ -169,15 +169,25 @@ async def _lookup_metadata(isbn13: str, hc_token: str | None, client: httpx.Asyn
             source = provider.__name__.rsplit(".", 1)[-1]
 
     if not metadata:
-        metadata = await openlibrary.lookup(isbn13, client, on_rate_limit=_saw_rate_limit)
+        try:
+            metadata = await openlibrary.lookup(
+                isbn13, client, on_rate_limit=_saw_rate_limit
+            )
+        except Exception:
+            logger.warning("Open Library metadata lookup failed for ISBN %s", isbn13, exc_info=True)
+            metadata = None
         if metadata:
             source = "openlibrary"
 
     hc_ids = {}
     if not metadata and hc_token:
-        metadata = await hardcover.lookup_by_isbn(
-            isbn13, client, token=hc_token, on_rate_limit=_saw_rate_limit
-        )
+        try:
+            metadata = await hardcover.lookup_by_isbn(
+                isbn13, client, token=hc_token, on_rate_limit=_saw_rate_limit
+            )
+        except Exception:
+            logger.warning("Hardcover metadata lookup failed for ISBN %s", isbn13, exc_info=True)
+            metadata = None
         if metadata:
             source = "hardcover"
             hc_ids = {
@@ -186,17 +196,25 @@ async def _lookup_metadata(isbn13: str, hc_token: str | None, client: httpx.Asyn
             }
 
     if not metadata:
-        metadata = await googlebooks.lookup(
-            isbn13, client, api_key=google_api_key, on_rate_limit=_saw_rate_limit)
+        try:
+            metadata = await googlebooks.lookup(
+                isbn13, client, api_key=google_api_key, on_rate_limit=_saw_rate_limit)
+        except Exception:
+            logger.warning("Google Books metadata lookup failed for ISBN %s", isbn13, exc_info=True)
+            metadata = None
         if metadata:
             source = "google"
 
     # Enrich with Hardcover data if primary source didn't have series/description
     if metadata and hc_token and source != "hardcover":
         if not metadata.get("series_name") or not metadata.get("description"):
-            hc_data = await hardcover.lookup_by_isbn(
-                isbn13, client, token=hc_token, on_rate_limit=_saw_rate_limit
-            )
+            try:
+                hc_data = await hardcover.lookup_by_isbn(
+                    isbn13, client, token=hc_token, on_rate_limit=_saw_rate_limit
+                )
+            except Exception:
+                logger.warning("Hardcover enrichment failed for ISBN %s", isbn13, exc_info=True)
+                hc_data = None
             if hc_data:
                 if hc_data.get("series_name") and not metadata.get("series_name"):
                     metadata["series_name"] = hc_data["series_name"]

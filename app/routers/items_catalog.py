@@ -195,7 +195,11 @@ async def search_books(
         search_lang = get_setting(db, "metadata_search_lang") or "en"
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        results = await openlibrary.search_books(q.strip(), client, limit=10, lang=search_lang)
+        try:
+            results = await openlibrary.search_books(q.strip(), client, limit=10, lang=search_lang)
+        except Exception:
+            logger.warning("Open Library title search failed for %r", q.strip(), exc_info=True)
+            results = []
 
     return templates.TemplateResponse(
         request, "fragments/book_search_results.html",

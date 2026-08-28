@@ -41,15 +41,21 @@ async def download_cover(item_id: int, isbn: str | None, cover_url: str | None, 
         if await _download(url, dest, client):
             return f"covers/{item_id}.jpg"
 
-    # Try Open Library cover by ISBN
+    # Prefer a cover URL returned by a provider that already matched the
+    # edition. This avoids an unnecessary Open Library ISBN probe and keeps a
+    # successful fallback provider's cover from being shadowed by a mismatch.
+    if hardcover_cover_url and is_allowed_cover_url(hardcover_cover_url):
+        if await _download(hardcover_cover_url, dest, client):
+            return f"covers/{item_id}.jpg"
+
+    if cover_url and is_allowed_cover_url(cover_url):
+        if await _download(cover_url, dest, client):
+            return f"covers/{item_id}.jpg"
+
+    # Try Open Library cover by ISBN after known provider URLs have failed.
     if isbn:
         url = f"https://covers.openlibrary.org/b/isbn/{isbn}-L.jpg"
         if await _download(url, dest, client):
-            return f"covers/{item_id}.jpg"
-
-    # Try Hardcover cover image
-    if hardcover_cover_url and is_allowed_cover_url(hardcover_cover_url):
-        if await _download(hardcover_cover_url, dest, client):
             return f"covers/{item_id}.jpg"
 
     # Try the DNB/MVB cover service for German-group ISBNs (probe 2026-08-20:
@@ -67,11 +73,6 @@ async def download_cover(item_id: int, isbn: str | None, cover_url: str | None, 
             url = f"https://images-na.ssl-images-amazon.com/images/P/{isbn10}.01._SCLZZZZZZZ_SX500_.jpg"
             if await _download(url, dest, client):
                 return f"covers/{item_id}.jpg"
-
-    # Try provided cover URL (e.g., from Google Books)
-    if cover_url and is_allowed_cover_url(cover_url):
-        if await _download(cover_url, dest, client):
-            return f"covers/{item_id}.jpg"
 
     return None
 

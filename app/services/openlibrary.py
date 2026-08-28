@@ -25,9 +25,9 @@ async def lookup(
     """Look up a book by ISBN via Open Library. Returns metadata dict or None.
 
     `on_rate_limit`, when given, is called once if the provider answered 429.
-    Defaulting to `None` keeps every existing caller byte-identical. This
-    function still has no try/except of its own — `_lookup_metadata`'s
-    callers handle whatever it raises.
+    Defaulting to `None` keeps every existing caller byte-identical. The
+    edition response is useful on its own, so optional work and author
+    enrichment is isolated below.
     """
     await _rate_limit()
     resp = await client.get(
@@ -61,15 +61,29 @@ async def lookup(
     if year_match:
         result["publish_year"] = int(year_match.group(1))
 
-    # Get author from works -> author chain
-    author = await _resolve_author(data, client)
-    if author:
-        result["authors"] = author
+    # Work data serves both author and description enrichment. Fetch it once;
+    # an unavailable work must not discard the usable edition metadata.
+    work = None
+    works = data.get("works", [])
+    if isinstance(works, list) and works and isinstance(works[0], dict) and works[0].get("key"):
+        try:
+            work = await _fetch_work(works[0]["key"], client)
+        except Exception:
+            logger.debug("Open Library work enrichment failed for ISBN %s", isbn, exc_info=True)
 
-    # Get description from work
-    desc = await _resolve_description(data, client)
-    if desc:
-        result["description"] = desc
+    try:
+        author = await _resolve_author(data, client, work=work)
+        if author:
+            result["authors"] = author
+    except Exception:
+        logger.debug("Open Library author enrichment failed for ISBN %s", isbn, exc_info=True)
+
+    if isinstance(work, dict):
+        desc = work.get("description")
+        if isinstance(desc, dict):
+            desc = desc.get("value")
+        if desc:
+            result["description"] = desc
 
     # Cover ID for URL construction
     covers = data.get("covers", [])
@@ -88,7 +102,8 @@ async def lookup(
     return result
 
 
-async def _resolve_author(edition_data: dict, client: httpx.AsyncClient) -> str | None:
+async def _resolve_author(edition_data: dict, client: httpx.AsyncClient,
+                          work: dict | None = None) -> str | None:
     works = edition_data.get("works", [])
     if not works:
         # Some editions have authors directly
@@ -99,16 +114,8 @@ async def _resolve_author(edition_data: dict, client: httpx.AsyncClient) -> str 
                 return await _fetch_author_name(akey, client)
         return None
 
-    await _rate_limit()
-    work_resp = await client.get(
-        f"https://openlibrary.org{works[0]['key']}.json",
-        headers={"User-Agent": USER_AGENT},
-        follow_redirects=True,
-    )
-    if work_resp.status_code != 200:
+    if work is None:
         return None
-
-    work = work_resp.json()
     authors = work.get("authors", [])
     if not authors:
         return None
@@ -122,6 +129,20 @@ async def _resolve_author(edition_data: dict, client: httpx.AsyncClient) -> str 
         return None
 
     return await _fetch_author_name(akey, client)
+
+
+async def _fetch_work(work_key: str, client: httpx.AsyncClient) -> dict | None:
+    """Fetch one Open Library work record for optional enrichment."""
+    await _rate_limit()
+    resp = await client.get(
+        f"https://openlibrary.org{work_key}.json",
+        headers={"User-Agent": USER_AGENT},
+        follow_redirects=True,
+    )
+    if resp.status_code != 200:
+        return None
+    work = resp.json()
+    return work if isinstance(work, dict) else None
 
 
 async def _fetch_author_name(author_key: str, client: httpx.AsyncClient) -> str | None:
@@ -186,20 +207,28 @@ async def search_by_title_author(title: str, author: str | None, client: httpx.A
 
 
 async def _search(params: dict, client: httpx.AsyncClient, limit: int, lang: str = "en") -> list[dict]:
-    await _rate_limit()
-    resp = await client.get(
-        "https://openlibrary.org/search.json",
-        # lang makes the `editions` subquery surface the best edition per
-        # work in the caller's configured search language, so translations
-        # in other languages don't win the ISBN pick
-        params={**params, "limit": str(limit), "fields": _SEARCH_FIELDS, "lang": lang},
-        headers={"User-Agent": USER_AGENT},
-    )
+    try:
+        await _rate_limit()
+        resp = await client.get(
+            "https://openlibrary.org/search.json",
+            # lang makes the `editions` subquery surface the best edition per
+            # work in the caller's configured search language, so translations
+            # in other languages don't win the ISBN pick
+            params={**params, "limit": str(limit), "fields": _SEARCH_FIELDS, "lang": lang},
+            headers={"User-Agent": USER_AGENT},
+        )
+    except Exception:
+        logger.warning("Open Library search request failed for %r", params, exc_info=True)
+        return []
     if resp.status_code != 200:
         logger.debug("Open Library search failed for %r: HTTP %d", params, resp.status_code)
         return []
 
-    docs = resp.json().get("docs", [])
+    try:
+        docs = resp.json().get("docs", [])
+    except (AttributeError, TypeError, ValueError):
+        logger.warning("Open Library search returned malformed JSON for %r", params)
+        return []
     results = []
     for doc in docs:
         title = doc.get("title")
