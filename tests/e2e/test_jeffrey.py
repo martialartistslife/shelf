@@ -12,7 +12,10 @@ def _force_random(page, value=0.05):
         f"""
         window.__jeffreyRandomCalls = 0;
         Math.random = function () {{
-            window.__jeffreyRandomCalls += 1;
+            var stack = new Error().stack || '';
+            if (stack.indexOf('/static/js/jeffrey.js') !== -1) {{
+                window.__jeffreyRandomCalls += 1;
+            }}
             return {value};
         }};
         """
@@ -169,7 +172,7 @@ def test_browse_htmx_change_removes_without_reroll(live_server, authed_page):
         authed_page.locator("select[name=sort]").select_option("title_asc")
 
     expect(authed_page.locator("#jeffrey-duck")).to_have_count(0)
-    assert authed_page.evaluate("window.__jeffreyRandomCalls") >= calls_before_swap
+    assert authed_page.evaluate("window.__jeffreyRandomCalls") == calls_before_swap
 
 
 def test_jeffrey_modal_activity_removes_it_without_reroll(live_server, authed_page):
