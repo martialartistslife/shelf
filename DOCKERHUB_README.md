@@ -1,10 +1,12 @@
 # Shelf
 
-A self-hosted home library catalog with barcode scanning, automatic metadata lookup, cover art, and collection management — all in a single Docker container.
+A self-hosted home library catalog — scan barcodes or photograph whole shelves, and Shelf fetches metadata and cover art, tracks lending, series and reading, and works offline in a bookstore. Single Docker container, SQLite, no cloud.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/dgahagan/shelf/main/screenshots/browse.png" width="800" alt="Browse your collection">
+  <img src="https://raw.githubusercontent.com/dgahagan/shelf/main/screenshots/demo.gif" width="800" alt="Photo Intake demo — a shelf photo is analyzed by AI vision and the books are imported with covers and metadata">
 </p>
+
+<p align="center"><em>Photo Intake: snap a shelf, AI reads the spines, books land in your library with covers and metadata.</em></p>
 
 ## Quick Start
 
@@ -61,11 +63,6 @@ CERT_SAN=IP:192.168.1.100,DNS:shelf,DNS:localhost
 | `SECRET_KEY` | *(auto-generated)* | JWT signing key for auth tokens. Auto-generated and stored in the database if not set. Set this explicitly if running multiple instances |
 | `SHELF_ENCRYPTION_KEY` | *(auto-generated)* | Encryption key for stored API credentials. Auto-generated at `/data/encryption.key` if not set. Set it explicitly (e.g. `openssl rand -hex 32`) so the data directory alone can't decrypt credentials |
 | `SHELF_TRUST_PROXY` | *(unset)* | Set to `1` when running behind a reverse proxy so client IPs are read from proxy headers |
-| `GOOGLE_BOOKS_API_KEY` | *(unset)* | Optional Google Books API key; overrides the encrypted Settings value |
-| `OPENLIBRARY_CONTACT` | *(unset)* | Contact email used to identify requests to Open Library |
-| `METADATA_PROVIDER_ORDER` | `openlibrary,hardcover,google` | Comma-separated metadata fallback order |
-| `METADATA_*_TIMEOUT` | `3` connect, `7` others | Metadata connect/read/write/pool phase timeouts in seconds |
-| `COVER_*_TIMEOUT` | `2` connect, `4` others | Cover connect/read/write/pool phase timeouts in seconds |
 
 ## Persistent Data
 
@@ -103,7 +100,7 @@ data/
 ## Features
 
 ### Scanning and Cataloging
-- **Camera barcode scanning** on mobile — tap to scan ISBNs and UPCs
+- **Camera barcode scanning** on mobile — tap to scan ISBNs and UPCs, on iPhone and iPad as well as Android (EAN-13, EAN-8, UPC-A, UPC-E)
 - **USB/Bluetooth scanner support** — works with any scanner that sends Enter after the barcode
 - **Photo intake** — bulk-add books from a photo of your shelves; a vision model (Anthropic API, any OpenAI-compatible endpoint, or fully local Ollama) reads the spines and you confirm before import
 - **Title search** — search Open Library, TMDb, or IGDB by title when you don't have a barcode
@@ -132,15 +129,18 @@ data/
 ### Collection Management
 - Filter and search by media type, location, reading status, ownership, lending status, and custom tags
 - Reading tracking — want-to-read, reading, and read with start/finish dates
-- Series tracking — grouped by series with position numbers, gap detection, and one-click "add missing volumes to wishlist" via Hardcover
+- Series tracking — grouped by series with position numbers, gap detection, and one-click "add missing volumes to wishlist" via Hardcover; series synopses, plus rename/merge/disband from the series card
 - Stats dashboard — books read per year, collection growth, top authors, and value-over-time charts
 - Locations — organize by room, shelf, or any system you like
 - Checkout system — lend to borrowers and track who has what, with overdue badges and an optional daily reminder digest (ntfy/webhook)
 - Wishlist — mark items as unowned alongside your catalog
 - Public share links — read-only wishlist or collection pages for gift ideas, revocable anytime
 - Goodreads & StoryGraph import — upload your export as-is; format auto-detected, covers fetched automatically
+- Custom tags — free-form tags (`signed`, `first-edition`, …) with a tag filter on Browse
+- Bulk editing — select items in Browse to move them, change type or reading status, or set and clear series in one go
 - Valuation report — location-grouped, print-ready collection value report for insurance (via ISBNdb)
-- CSV import/export
+- Display currency — 20 currencies for every value surface (formatting, not conversion)
+- CSV import/export, plus a portable archive — export the whole collection as one zip **including cover art** and merge it into any Shelf instance without refetching a cover
 
 ### Multi-User
 - **Admin** — full control: settings, users, locations, sync, bulk ops, logs
@@ -185,7 +185,8 @@ Your data in the `/data` volume is preserved across updates.
 |-----|-------------|
 | `latest` | Latest stable release |
 | `beta` | Latest beta — may have rough edges |
-| `x.y.z` | Specific version (e.g., `0.1.0`) |
+| `x.y` | Latest patch of a minor line (e.g., `0.10`) |
+| `x.y.z` | Specific version (e.g., `0.10.1`) |
 
 ## Tech Stack
 

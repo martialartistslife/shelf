@@ -11,9 +11,11 @@ data-dev/
 .coverage
 .playwright-mcp/
 .claude/
-docs/
+.devdocs
+reports/
 tests/
 screenshots/
+docs/
 scripts/
 node_modules/
 *.md

@@ -1,48 +1,42 @@
-import asyncio
 import logging
-import os
+from collections.abc import Callable
 
 import httpx
 
-from app.config import OPENLIBRARY_RATE_LIMIT, METADATA_HTTP_TIMEOUT
+from app.services import outbound
 
 logger = logging.getLogger(__name__)
 
-_last_request = 0.0
-
-
-def _request_headers() -> dict[str, str]:
-    """Identify Shelf consistently, with an optional deployer contact."""
-    contact = os.environ.get("OPENLIBRARY_CONTACT", "").strip()
-    user_agent = "Shelf/1.0 (self-hosted home library catalog"
-    if contact:
-        user_agent += f"; contact: {contact}"
-    return {"User-Agent": user_agent + ")"}
-
-
-def _request_interval() -> float:
-    """Open Library permits identified clients a higher request rate."""
-    return OPENLIBRARY_RATE_LIMIT if os.environ.get("OPENLIBRARY_CONTACT", "").strip() else 1.0
+# Open Library grants 3 req/s only to requests identifying themselves with an
+# app name AND contact information (https://openlibrary.org/developers/api);
+# without it the published rate is 1 req/s. A public project URL only — never
+# a personal email — this directory is subtree-published to a public repo.
+USER_AGENT = "Shelf/1.0 (+https://github.com/dgahagan/shelf)"
 
 
 async def _rate_limit():
-    global _last_request
-    now = asyncio.get_event_loop().time()
-    wait = _request_interval() - (now - _last_request)
-    if wait > 0:
-        await asyncio.sleep(wait)
-    _last_request = asyncio.get_event_loop().time()
+    await outbound.acquire("openlibrary.org")
 
 
-async def lookup(isbn: str, client: httpx.AsyncClient) -> dict | None:
-    """Look up a book by ISBN via Open Library. Returns metadata dict or None."""
+async def lookup(
+    isbn: str, client: httpx.AsyncClient,
+    *, on_rate_limit: Callable[[], None] | None = None,
+) -> dict | None:
+    """Look up a book by ISBN via Open Library. Returns metadata dict or None.
+
+    `on_rate_limit`, when given, is called once if the provider answered 429.
+    Defaulting to `None` keeps every existing caller byte-identical. The
+    edition response is useful on its own, so optional work and author
+    enrichment is isolated below.
+    """
     await _rate_limit()
     resp = await client.get(
         f"https://openlibrary.org/isbn/{isbn}.json",
-        headers=_request_headers(),
+        headers={"User-Agent": USER_AGENT},
         follow_redirects=True,
-        timeout=METADATA_HTTP_TIMEOUT,
     )
+    if on_rate_limit is not None and outbound.is_rate_limited(resp):
+        on_rate_limit()
     if resp.status_code != 200:
         logger.debug("Open Library lookup failed for ISBN %s: HTTP %d", isbn, resp.status_code)
         return None
@@ -67,11 +61,11 @@ async def lookup(isbn: str, client: httpx.AsyncClient) -> dict | None:
     if year_match:
         result["publish_year"] = int(year_match.group(1))
 
-    # Edition metadata remains useful even if optional work/author enrichment
-    # is unavailable. Fetch the work at most once for both enrichments.
+    # Work data serves both author and description enrichment. Fetch it once;
+    # an unavailable work must not discard the usable edition metadata.
     work = None
     works = data.get("works", [])
-    if works and isinstance(works[0], dict) and works[0].get("key"):
+    if isinstance(works, list) and works and isinstance(works[0], dict) and works[0].get("key"):
         try:
             work = await _fetch_work(works[0]["key"], client)
         except Exception:
@@ -84,7 +78,7 @@ async def lookup(isbn: str, client: httpx.AsyncClient) -> dict | None:
     except Exception:
         logger.debug("Open Library author enrichment failed for ISBN %s", isbn, exc_info=True)
 
-    if work:
+    if isinstance(work, dict):
         desc = work.get("description")
         if isinstance(desc, dict):
             desc = desc.get("value")
@@ -95,6 +89,15 @@ async def lookup(isbn: str, client: httpx.AsyncClient) -> dict | None:
     covers = data.get("covers", [])
     if covers:
         result["cover_id"] = covers[0]
+
+    # Edition language, e.g. [{"key": "/languages/ger"}] -> "de"
+    languages = data.get("languages") or []
+    if languages and isinstance(languages[0], dict):
+        from app.services.national import to_iso639_1
+
+        lang = to_iso639_1(languages[0].get("key"))
+        if lang:
+            result["language"] = lang
 
     return result
 
@@ -128,13 +131,26 @@ async def _resolve_author(edition_data: dict, client: httpx.AsyncClient,
     return await _fetch_author_name(akey, client)
 
 
+async def _fetch_work(work_key: str, client: httpx.AsyncClient) -> dict | None:
+    """Fetch one Open Library work record for optional enrichment."""
+    await _rate_limit()
+    resp = await client.get(
+        f"https://openlibrary.org{work_key}.json",
+        headers={"User-Agent": USER_AGENT},
+        follow_redirects=True,
+    )
+    if resp.status_code != 200:
+        return None
+    work = resp.json()
+    return work if isinstance(work, dict) else None
+
+
 async def _fetch_author_name(author_key: str, client: httpx.AsyncClient) -> str | None:
     await _rate_limit()
     resp = await client.get(
         f"https://openlibrary.org{author_key}.json",
-        headers=_request_headers(),
+        headers={"User-Agent": USER_AGENT},
         follow_redirects=True,
-        timeout=METADATA_HTTP_TIMEOUT,
     )
     if resp.status_code != 200:
         return None
@@ -151,28 +167,13 @@ async def _resolve_description(edition_data: dict, client: httpx.AsyncClient) ->
     return await get_work_description(works[0]["key"], client)
 
 
-async def _fetch_work(work_key: str, client: httpx.AsyncClient) -> dict | None:
-    """Fetch an Open Library work record."""
-    await _rate_limit()
-    resp = await client.get(
-        f"https://openlibrary.org{work_key}.json",
-        headers=_request_headers(),
-        follow_redirects=True,
-        timeout=METADATA_HTTP_TIMEOUT,
-    )
-    if resp.status_code != 200:
-        return None
-    return resp.json()
-
-
 async def get_work_description(work_key: str, client: httpx.AsyncClient) -> str | None:
     """Fetch a work record (e.g. '/works/OL27448W') and return its description."""
     await _rate_limit()
     resp = await client.get(
         f"https://openlibrary.org{work_key}.json",
-        headers=_request_headers(),
+        headers={"User-Agent": USER_AGENT},
         follow_redirects=True,
-        timeout=METADATA_HTTP_TIMEOUT,
     )
     if resp.status_code != 200:
         return None
@@ -187,13 +188,14 @@ _SEARCH_FIELDS = ("key,title,author_name,first_publish_year,publisher,cover_i,is
                   "number_of_pages_median,language,editions,editions.isbn")
 
 
-async def search_books(query: str, client: httpx.AsyncClient, limit: int = 10) -> list[dict]:
+async def search_books(query: str, client: httpx.AsyncClient, limit: int = 10,
+                        lang: str = "en") -> list[dict]:
     """Search Open Library by title. Returns list of book summaries."""
-    return await _search({"q": query}, client, limit)
+    return await _search({"q": query}, client, limit, lang)
 
 
 async def search_by_title_author(title: str, author: str | None, client: httpx.AsyncClient,
-                                 limit: int = 5) -> list[dict]:
+                                 limit: int = 5, lang: str = "en") -> list[dict]:
     """Field-scoped search — Open Library matches the title itself (including
     alternate titles, so '1984' finds 'Nineteen Eighty-Four'). Callers must
     still check authors: adaptations/study guides of famous titles rank high.
@@ -201,19 +203,19 @@ async def search_by_title_author(title: str, author: str | None, client: httpx.A
     params = {"title": title}
     if author:
         params["author"] = author
-    return await _search(params, client, limit)
+    return await _search(params, client, limit, lang)
 
 
-async def _search(params: dict, client: httpx.AsyncClient, limit: int) -> list[dict]:
+async def _search(params: dict, client: httpx.AsyncClient, limit: int, lang: str = "en") -> list[dict]:
     try:
         await _rate_limit()
         resp = await client.get(
             "https://openlibrary.org/search.json",
-            # lang=en makes the `editions` subquery surface the best English
-            # edition per work, so translations don't win the ISBN pick
-            params={**params, "limit": str(limit), "fields": _SEARCH_FIELDS, "lang": "en"},
-            headers=_request_headers(),
-            timeout=METADATA_HTTP_TIMEOUT,
+            # lang makes the `editions` subquery surface the best edition per
+            # work in the caller's configured search language, so translations
+            # in other languages don't win the ISBN pick
+            params={**params, "limit": str(limit), "fields": _SEARCH_FIELDS, "lang": lang},
+            headers={"User-Agent": USER_AGENT},
         )
     except Exception:
         logger.warning("Open Library search request failed for %r", params, exc_info=True)
@@ -224,7 +226,7 @@ async def _search(params: dict, client: httpx.AsyncClient, limit: int) -> list[d
 
     try:
         docs = resp.json().get("docs", [])
-    except (TypeError, ValueError):
+    except (AttributeError, TypeError, ValueError):
         logger.warning("Open Library search returned malformed JSON for %r", params)
         return []
     results = []

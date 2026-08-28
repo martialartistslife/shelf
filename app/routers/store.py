@@ -1,6 +1,6 @@
 """Store mode: offline-capable PWA for "do I own this?" checks in bookstores.
 
-See docs/plans/PWA_STORE_MODE.md. The /store page and its assets are
+See .devdocs/archive/completed/PWA_STORE_MODE.md. The /store page and its assets are
 precached by the service worker (static/sw.js); library data is fetched from
 /api/store/data and kept in localStorage on the device; barcodes scanned
 offline for unknown books queue locally and are flushed to /api/store/queue
@@ -19,6 +19,7 @@ from app.config import HTTP_TIMEOUT
 from app.database import get_db, get_setting
 from app.services import covers
 from app.services import isbn as isbn_svc
+from app.services.item_write import insert_item
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +90,7 @@ async def store_queue(request: Request, _=Depends(require_role("editor"))):
     (not found, timeout, offline server), a bare wishlist item is created
     with the ISBN as its title so it can be enriched later.
     """
-    from app.routers.items import _log_scan, _lookup_metadata, _save_item
+    from app.routers import items_common
 
     try:
         body = await request.json()
@@ -127,15 +128,19 @@ async def store_queue(request: Request, _=Depends(require_role("editor"))):
 
             metadata, source, hc_ids = None, None, {}
             try:
-                metadata, source, hc_ids = await _lookup_metadata(
-                    isbn13, hc_token, client, google_api_key)
+                # `_` = the rate-limited flag. Store Mode's queue flush has no
+                # scan card to render it on; inventing a surface for it is a
+                # later plan's scope, not an oversight.
+                metadata, source, hc_ids, _ = await items_common._lookup_metadata(
+                    isbn13, hc_token, client, google_api_key=google_api_key
+                )
             except Exception:
                 logger.warning("Store queue: metadata lookup failed for %s", isbn13)
 
             item_id = None
             if metadata:
                 try:
-                    item_id = _save_item(metadata, isbn13, "book", None, source, hc_ids)
+                    item_id = items_common._save_item(metadata, isbn13, "book", None, source, hc_ids)
                     with get_db() as db:
                         db.execute("UPDATE items SET owned = 0 WHERE id = ?", (item_id,))
                     try:
@@ -151,7 +156,7 @@ async def store_queue(request: Request, _=Depends(require_role("editor"))):
                                 db.execute("UPDATE items SET cover_path = ? WHERE id = ?", (cover_path, item_id))
                     except Exception:
                         logger.warning("Store queue: cover download failed for %s", isbn13)
-                    _log_scan(isbn13, "book", "wishlisted", item_id, "wishlist")
+                    items_common._log_scan(isbn13, "book", "wishlisted", item_id, "wishlist")
                     results.append({
                         "isbn": isbn13, "status": "wishlisted",
                         "title": metadata["title"], "item_id": item_id,
@@ -162,13 +167,15 @@ async def store_queue(request: Request, _=Depends(require_role("editor"))):
 
             # Bare fallback — never lose a scan
             with get_db() as db:
-                cur = db.execute(
-                    "INSERT INTO items (title, isbn, media_type, owned, source) "
-                    "VALUES (?, ?, 'book', 0, 'store_queue')",
-                    (f"Unknown — ISBN {isbn13}", isbn13),
+                item_id = insert_item(
+                    db,
+                    title=f"Unknown — ISBN {isbn13}",
+                    isbn=isbn13,
+                    media_type="book",
+                    owned=0,
+                    source="store_queue",
                 )
-                item_id = cur.lastrowid
-            _log_scan(isbn13, "book", "wishlisted", item_id, "wishlist")
+            items_common._log_scan(isbn13, "book", "wishlisted", item_id, "wishlist")
             results.append({"isbn": isbn13, "status": "added_bare", "item_id": item_id})
 
     return {"results": results}

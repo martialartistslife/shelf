@@ -3,7 +3,7 @@
 {% block content %}
 <div class="max-w-3xl mx-auto" x-data="intakePage">
     <h1 class="text-2xl font-bold mb-1">Photo Intake</h1>
-    <p class="text-sm text-shelf-muted mb-6">Photograph a shelf, let the vision model read the spines, then confirm which books to add.</p>
+    <p class="text-sm text-shelf-muted mb-6">Photograph books on a shelf, in a stack, or face-up &mdash; front cover is fine. The vision model reads spines and recognizes covers; a readable back-cover barcode gives exact-edition metadata. Review the list, then confirm.</p>
 
     {% if not vision_provider %}
     <div class="bg-shelf-card rounded-xl border border-shelf-warning/30 p-6 text-sm">
@@ -15,18 +15,56 @@
     <!-- Step 1: choose / capture photo -->
     <div class="bg-shelf-card rounded-xl border border-shelf-border p-6 mb-6">
         <div class="flex flex-col sm:flex-row sm:items-center gap-3">
-            <input type="file" accept="image/*" capture="environment" x-ref="photoInput"
-                   @change="onFileChosen($event)"
-                   class="text-sm text-shelf-muted file:mr-3 file:rounded-lg file:border-0 file:bg-shelf-hover file:px-3 file:py-1.5 file:text-sm file:text-shelf-text hover:file:bg-shelf-border">
-            <button @click="analyze(false)" :disabled="!file || analyzing || planning" x-show="!needsChoice"
+            <!-- Two explicit affordances. The library input carries no `capture`
+                 so phones offer the photo library; the capture input carries it
+                 so they open the camera app. takePhoto() routes between them and
+                 the desktop viewfinder at click time. -->
+            <input type="file" accept="image/*" class="hidden" x-ref="photoInput"
+                   @change="onFileChosen($event)" data-testid="intake-choose-input">
+            <input type="file" accept="image/*" capture="environment" class="hidden" x-ref="captureInput"
+                   @change="onFileChosen($event)" data-testid="intake-capture-input">
+            <button type="button" @click="takePhoto()" x-show="cameraAvailable" x-cloak
+                    :disabled="viewfinder || analyzing" data-testid="intake-take-photo"
+                    class="px-4 py-2 bg-shelf-hover text-shelf-text rounded-lg text-sm hover:bg-shelf-border transition-colors disabled:opacity-50 whitespace-nowrap">Take photo</button>
+            <button type="button" @click="$refs.photoInput.click()"
+                    :disabled="viewfinder || analyzing" data-testid="intake-choose-photo"
+                    class="px-4 py-2 bg-shelf-hover text-shelf-text rounded-lg text-sm hover:bg-shelf-border transition-colors disabled:opacity-50 whitespace-nowrap">Choose photo</button>
+            <button @click="analyze(false)" :disabled="!file || analyzing || planning || viewfinder" x-show="!needsChoice"
                     class="px-4 py-2 bg-shelf-accent text-white rounded-lg text-sm hover:bg-shelf-accent2 transition-colors disabled:opacity-50 whitespace-nowrap">
-                <span x-show="!analyzing">Read Spines</span>
+                <span x-show="!analyzing">Read Photo</span>
                 <span x-show="analyzing">Reading&hellip;</span>
             </button>
         </div>
+        <!-- Desktop webcam viewfinder. Always in the DOM (x-show, not x-if): the
+             <video> must exist before createPhotoCapture() resolves it, and an
+             x-if would re-create it on every retake. -->
+        <div data-testid="intake-viewfinder" x-show="viewfinder" x-cloak class="mt-4">
+            <div class="rounded-xl overflow-hidden border border-shelf-border bg-black">
+                <video id="intake-video" class="w-full" autoplay muted playsinline></video>
+            </div>
+            <div class="flex gap-3 mt-3">
+                <button type="button" @click="grabFrame()" data-testid="intake-capture-btn"
+                        class="px-4 py-2 bg-shelf-accent text-white rounded-lg text-sm hover:bg-shelf-accent2 transition-colors whitespace-nowrap">Capture</button>
+                <button type="button" @click="cancelViewfinder()" data-testid="intake-capture-cancel"
+                        class="px-4 py-2 bg-shelf-hover text-shelf-text rounded-lg text-sm hover:bg-shelf-border transition-colors whitespace-nowrap">Cancel</button>
+            </div>
+        </div>
         <p class="text-xs text-shelf-muted mt-2">Provider: <span class="text-shelf-text">{{ {'anthropic': 'Anthropic API', 'openai': 'OpenAI-compatible', 'ollama': 'Ollama (local)'}.get(vision_provider, vision_provider) }}</span> &middot; photos are analyzed in memory and not stored.</p>
+        <div class="flex flex-col sm:flex-row sm:items-center gap-3 mt-4 pt-3 border-t border-shelf-border">
+            <label class="text-sm text-shelf-muted whitespace-nowrap" for="intake-location">Add books to</label>
+            <select id="intake-location" x-model="locationId" x-ref="locationSelect" class="bg-shelf-bg border border-shelf-border rounded-lg px-3 py-2 text-sm text-shelf-text focus:ring-2 focus:ring-shelf-accent outline-none">
+                <option value="">No location</option>
+                {% for loc in locations %}
+                <option value="{{ loc.id }}">{{ loc.name }}</option>
+                {% endfor %}
+            </select>
+            <label class="flex items-center gap-2 text-sm text-shelf-muted cursor-pointer">
+                <input type="checkbox" x-model="owned" class="rounded border-shelf-border bg-shelf-bg text-shelf-accent focus:ring-shelf-accent">
+                Owned (uncheck for wishlist)
+            </label>
+        </div>
         <template x-if="preview">
-            <img :src="preview" alt="Shelf photo preview" class="mt-4 rounded-lg max-h-64" x-show="!needsChoice">
+            <img :src="preview" alt="Shelf photo preview" class="mt-4 rounded-lg max-h-64" x-show="!needsChoice && !viewfinder">
         </template>
         <p x-show="error" x-cloak class="text-sm text-shelf-error mt-3" x-text="error"></p>
     </div>
@@ -41,15 +79,15 @@
                 if you can't read the spines here, neither can it.
             </p>
             <div class="overflow-auto max-h-96 rounded-lg border border-shelf-border mb-4 bg-shelf-bg">
-                <canvas x-ref="modelPreview" class="block"></canvas>
+                <canvas x-ref="modelPreview" data-testid="intake-model-preview" class="block"></canvas>
             </div>
             <div class="flex flex-col sm:flex-row gap-3">
-                <button @click="analyze(false)" :disabled="analyzing"
+                <button @click="analyze(false)" :disabled="analyzing" data-testid="intake-send-as-is"
                         class="px-4 py-2 bg-shelf-hover text-shelf-text rounded-lg text-sm hover:bg-shelf-border transition-colors disabled:opacity-50">
                     <span x-show="!analyzing">Send as-is (<span x-text="fmtCost(plan.cost_as_is_usd)"></span>)</span>
                     <span x-show="analyzing">Reading&hellip;</span>
                 </button>
-                <button @click="analyze(true)" :disabled="analyzing"
+                <button @click="analyze(true)" :disabled="analyzing" data-testid="intake-send-tiled"
                         class="px-4 py-2 bg-shelf-accent text-white rounded-lg text-sm hover:bg-shelf-accent2 transition-colors disabled:opacity-50">
                     <span x-show="!analyzing">Send high-res &mdash; <span x-text="tileCount()"></span> tiles (<span x-text="fmtCost(plan.cost_tiled_usd)"></span>)</span>
                     <span x-show="analyzing">Reading&hellip;</span>
@@ -58,6 +96,52 @@
             <p class="text-xs text-shelf-muted mt-2">High-res splits the original into overlapping full-resolution tiles so every spine stays legible. Cost estimates are approximate.</p>
         </div>
     </template>
+
+    <!-- Step 1c: low-resolution advisory. Advisory, not a gate — Read Photo
+         stays enabled. Mutually exclusive with the tiling card above: the
+         server only sets low_res when needs_choice is false. -->
+    <template x-if="lowRes">
+        <div data-testid="intake-low-res" class="bg-shelf-card rounded-xl border border-shelf-warning/30 p-6 mb-6">
+            <h2 class="text-lg font-semibold text-shelf-warning mb-1">This photo may be too small to read</h2>
+            <p class="text-sm text-shelf-muted mb-3">
+                This photo is <span class="text-shelf-text font-medium" x-text="photoW"></span>&times;<span class="text-shelf-text font-medium" x-text="photoH"></span>.
+                Spines this small often don't read well &mdash; take or choose another photo, or click Read Photo anyway.
+            </p>
+            <div class="flex flex-col sm:flex-row gap-3">
+                <button type="button" @click="takePhoto()" x-show="cameraAvailable" x-cloak data-testid="intake-retake"
+                        :disabled="viewfinder || analyzing"
+                        class="px-4 py-2 bg-shelf-hover text-shelf-text rounded-lg text-sm hover:bg-shelf-border transition-colors disabled:opacity-50 whitespace-nowrap">Take another photo</button>
+                <button type="button" @click="$refs.photoInput.click()" data-testid="intake-choose-another"
+                        :disabled="viewfinder || analyzing"
+                        class="px-4 py-2 bg-shelf-hover text-shelf-text rounded-lg text-sm hover:bg-shelf-border transition-colors disabled:opacity-50 whitespace-nowrap">Choose another photo</button>
+            </div>
+        </div>
+    </template>
+
+    <!-- Working indicators: analyze and confirm are long vision/network
+         calls — the button-label swap alone is invisible on mobile -->
+    <div x-show="analyzing" x-cloak
+         class="bg-shelf-card rounded-xl border border-shelf-accent/40 p-5 mb-6 flex items-center gap-4">
+        <svg class="animate-spin h-6 w-6 text-shelf-accent shrink-0" fill="none" viewBox="0 0 24 24" aria-hidden="true">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+        </svg>
+        <div>
+            <p class="text-sm font-medium">Reading your photo&hellip;</p>
+            <p class="text-xs text-shelf-muted">The vision model is analyzing your photo &mdash; large shelves can take a minute.</p>
+        </div>
+    </div>
+    <div x-show="confirming" x-cloak
+         class="bg-shelf-card rounded-xl border border-shelf-accent/40 p-5 mb-6 flex items-center gap-4">
+        <svg class="animate-spin h-6 w-6 text-shelf-accent shrink-0" fill="none" viewBox="0 0 24 24" aria-hidden="true">
+            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+        </svg>
+        <div>
+            <p class="text-sm font-medium">Adding books&hellip;</p>
+            <p class="text-xs text-shelf-muted">Looking up metadata for each selected book &mdash; a few seconds per book.</p>
+        </div>
+    </div>
 
     <!-- Step 2: review candidates -->
     <div x-show="books.length > 0" x-cloak class="bg-shelf-card rounded-xl border border-shelf-border p-6 mb-6">
@@ -70,20 +154,53 @@
         </div>
         <div class="space-y-2 mb-4">
             <template x-for="(book, i) in books" :key="i">
-                <div class="flex items-center gap-2">
-                    {# :checked/:value + handler methods, not x-model="book.…": the
-                       Alpine CSP build cannot evaluate nested-path assignments #}
-                    <input type="checkbox" :checked="book.include" @change="toggleInclude(i)"
-                           class="rounded border-shelf-border bg-shelf-bg text-shelf-accent focus:ring-shelf-accent shrink-0">
-                    <input type="text" :value="book.title" @input="setBookTitle(i, $event.target.value)" placeholder="Title"
-                           class="flex-1 min-w-0 bg-shelf-bg border border-shelf-border rounded-lg px-3 py-1.5 text-sm text-shelf-text focus:ring-1 focus:ring-shelf-accent outline-none">
+                <div class="flex flex-wrap items-center gap-2" data-testid="intake-row">
+                    {# :checked/:value/@change + handler methods, not x-model="book.…"
+                       (inputs AND the select): the Alpine CSP build cannot evaluate
+                       nested-path assignments #}
+                    {# Below lg the row is three declared lines: checkbox+title+badge, then
+                       author+isbn, then the media select. The wrapper keeps the badge next
+                       to the title it qualifies and the checkbox off a line of its own.
+                       The seam is `lg` (1024px). It was `md` (768px) until the CI runner
+                       disagreed with the dev machine about it: everything except the title
+                       is either a fixed width or *content*-derived — checkbox 13 + badge 65
+                       + Author 128 + ISBN 128 + select 192 + five 8px gaps = 566px of a
+                       670px content box at 768px, leaving the title 104px here and 92px on
+                       a runner whose default sans-serif is wider. Two of those three
+                       numbers move with the font, so 768px never had a title floor it could
+                       hold on every machine — it fit on one. At `lg` the title gets ~360px
+                       and the font stops mattering. Do not lower this seam without redoing
+                       that arithmetic against the *widest* plausible font, not the local one.
+                       No `lg:basis-auto` on the wrapper: Tailwind emits .basis-* AFTER
+                       .flex-* inside a variant block, so it would override lg:flex-1's
+                       flex-basis:0% back to auto, the wrapper would be packed at its
+                       ~446px max-content width, and the select would drop to a second
+                       line on desktop (GOTCHAS G43). The select below does need it: it
+                       has no lg:flex-* to reset basis-full. #}
+                    <div class="basis-full lg:flex-1 min-w-0 flex items-center gap-2">
+                        <input type="checkbox" :checked="book.include" @change="toggleInclude(i)"
+                               class="rounded border-shelf-border bg-shelf-bg text-shelf-accent focus:ring-shelf-accent shrink-0">
+                        <input type="text" :value="book.title" @input="setBookTitle(i, $event.target.value)" placeholder="Title"
+                               class="flex-1 min-w-0 bg-shelf-bg border border-shelf-border rounded-lg px-3 py-1.5 text-sm text-shelf-text focus:ring-1 focus:ring-shelf-accent outline-none">
+                        <span x-show="book.source === 'recognized'" x-cloak data-testid="intake-recognized"
+                              title="Identified from the cover, not read — double-check"
+                              class="px-1.5 py-0.5 rounded text-[10px] font-medium bg-shelf-warning/90 text-black shrink-0">recognized</span>
+                    </div>
                     <input type="text" :value="book.authors" @input="setBookAuthors(i, $event.target.value)" placeholder="Author"
-                           class="w-48 bg-shelf-bg border border-shelf-border rounded-lg px-3 py-1.5 text-sm text-shelf-text focus:ring-1 focus:ring-shelf-accent outline-none">
+                           class="flex-1 min-w-0 lg:flex-none lg:w-32 bg-shelf-bg border border-shelf-border rounded-lg px-3 py-1.5 text-sm text-shelf-text focus:ring-1 focus:ring-shelf-accent outline-none">
+                    <input type="text" :value="book.isbn" @input="setBookIsbn(i, $event.target.value)" placeholder="ISBN"
+                           inputmode="numeric" data-testid="intake-isbn"
+                           class="flex-1 min-w-0 lg:flex-none lg:w-32 bg-shelf-bg border border-shelf-border rounded-lg px-3 py-1.5 text-sm text-shelf-text focus:ring-1 focus:ring-shelf-accent outline-none">
+                    <select :value="book.media_type" @change="setBookMediaType(i, $event.target.value)"
+                            aria-label="Media type" data-testid="intake-media-type"
+                            class="basis-full lg:basis-auto bg-shelf-bg border border-shelf-border rounded-lg px-3 py-1.5 text-sm text-shelf-text focus:ring-1 focus:ring-shelf-accent outline-none">
+                        {% for key, label in media_types.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}
+                    </select>
                 </div>
             </template>
         </div>
         <div class="flex flex-col sm:flex-row sm:items-center gap-3 pt-3 border-t border-shelf-border">
-            <select x-model="locationId" class="bg-shelf-bg border border-shelf-border rounded-lg px-3 py-2 text-sm text-shelf-text focus:ring-2 focus:ring-shelf-accent outline-none">
+            <select x-model="locationId" aria-label="Location" class="bg-shelf-bg border border-shelf-border rounded-lg px-3 py-2 text-sm text-shelf-text focus:ring-2 focus:ring-shelf-accent outline-none">
                 <option value="">No location</option>
                 {% for loc in locations %}
                 <option value="{{ loc.id }}">{{ loc.name }}</option>
@@ -105,15 +222,17 @@
     <div x-show="result" x-cloak class="bg-shelf-card rounded-xl border border-shelf-border p-6">
         <h2 class="text-lg font-semibold mb-3">Done</h2>
         <p class="text-sm text-shelf-muted mb-3">
-            Added <span class="text-shelf-success font-medium" x-text="result && result.added.length"></span>
-            <span x-show="result && result.skipped.length > 0">
-                &middot; skipped <span x-text="result && result.skipped.length"></span>
+            Added <span class="text-shelf-success font-medium" x-text="result ? result.added.length : ''"></span>
+            <span x-show="result ? result.skipped.length > 0 : false">
+                &middot; skipped <span x-text="result ? result.skipped.length : ''"></span>
             </span>
             &mdash; covers are fetched in the background.
         </p>
         <div class="space-y-1 text-sm">
+            {# single root element per x-for row — the vendored CSP build renders
+               firstElementChild only #}
             <template x-for="a in (result ? result.added : [])" :key="'a' + a.id">
-                <p><a :href="'/item/' + a.id" class="text-shelf-accent2 hover:text-shelf-accent" x-text="a.title"></a></p>
+                <p data-testid="intake-added-row"><a :href="'/item/' + a.id" class="text-shelf-accent2 hover:text-shelf-accent" x-text="a.title"></a><span x-show="!a.matched" x-cloak data-testid="intake-no-metadata" class="text-xs text-shelf-muted ml-1">&mdash; no metadata found, added title only</span></p>
             </template>
             <template x-for="(s, i) in (result ? result.skipped : [])" :key="'s' + i">
                 <p class="text-shelf-muted"><span x-text="s.title"></span> <span class="text-xs">(<span x-text="s.reason"></span>)</span></p>
@@ -126,5 +245,6 @@
     {% endif %}
 </div>
 
+<script src="/static/js/intake-capture.js"></script>
 <script src="/static/js/intake.js"></script>
 {% endblock %}

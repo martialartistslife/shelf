@@ -1,11 +1,16 @@
 from datetime import date, datetime, timedelta
-from fastapi import APIRouter, Depends, Request
+
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import RedirectResponse
 
+from app import browse_filters, nav
 from app.auth import require_role
 from app.config import MEDIA_TYPES, DEFAULT_PAGE_SIZE
-from app.database import get_db, get_setting, get_game_platforms
-from app.routers.items import SORT_OPTIONS, build_browse_url
+from app.currency import get_currency
+from app.database import get_db, get_setting, get_game_platforms, get_reading_history
+from app.routers import items_common
+from app.routers.items_common import SORT_OPTIONS
+from app.routers.series import find_gaps
 
 router = APIRouter()
 
@@ -18,52 +23,23 @@ async def index():
 @router.get("/browse")
 async def browse(
     request: Request,
-    q: str = "",
-    media_type_filter: str = "",
-    location_filter: str = "",
-    sort: str = "newest",
-    reading_status: str = "",
-    owned: str = "",
-    lent_out: str = "",
-    tag: str = "",
-    view: str = "grid",
     _=Depends(require_role("viewer")),
 ):
-    with get_db() as db:
-        # Build filter conditions
-        conditions: list[str] = []
-        params: list = []
-        if q:
-            conditions.append(
-                "(i.title LIKE ? OR i.authors LIKE ? OR i.isbn LIKE ? OR i.narrator LIKE ?)"
-            )
-            params.extend([f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%"])
-        if location_filter:
-            conditions.append("i.location_id = ?")
-            params.append(int(location_filter))
-        if tag:
-            conditions.append(
-                "i.id IN (SELECT it.item_id FROM item_tags it "
-                "JOIN tags t ON it.tag_id = t.id WHERE t.name = ?)"
-            )
-            params.append(tag)
-        if reading_status:
-            conditions.append("i.reading_status = ?")
-            params.append(reading_status)
-        if lent_out == "1":
-            conditions.append(
-                "i.id IN (SELECT item_id FROM checkouts WHERE checked_in IS NULL)"
-            )
-        if media_type_filter:
-            conditions.append("i.media_type = ?")
-            params.append(media_type_filter)
-        if owned == "1":
-            conditions.append("i.owned = 1")
-        elif owned == "0":
-            conditions.append("i.owned = 0")
+    """The Collection page — first paint of the item grid and its filters.
 
-        where = "WHERE " + " AND ".join(conditions) if conditions else ""
-        _, order_clause = SORT_OPTIONS.get(sort, SORT_OPTIONS["newest"])
+    Filter values are read from the query string via the registry rather than
+    declared as parameters here, exactly as `/api/search` does: a filter added
+    to `app/browse_filters.py` needs no change in this signature. The dropdown
+    counts come from the same `items_common.filter_counts` helper `/api/search`
+    uses, so the first paint and the first OOB swap cannot disagree.
+    """
+    values = browse_filters.values_from(request.query_params)
+    # Truncate search query to prevent slow LIKE scans (parity with /api/search)
+    values["q"] = values["q"][:200]
+    where, params = browse_filters.build_where(values)
+
+    with get_db() as db:
+        _, order_clause = SORT_OPTIONS.get(values["sort"], SORT_OPTIONS["newest"])
 
         from app.routers.checkouts import OVERDUE_CONDITION, get_overdue_days
         items = db.execute(
@@ -81,90 +57,68 @@ async def browse(
             f"SELECT COUNT(*) as c FROM items i {where}", params
         ).fetchone()["c"]
 
-        locations = db.execute(
-            "SELECT * FROM locations ORDER BY sort_order, name"
-        ).fetchall()
-        type_counts = {
-            row["media_type"]: row["c"]
+        series_names = [
+            row["series_name"]
             for row in db.execute(
-                "SELECT media_type, COUNT(*) as c FROM items GROUP BY media_type"
+                "SELECT DISTINCT series_name FROM items "
+                "WHERE series_name IS NOT NULL AND TRIM(series_name) != '' "
+                "ORDER BY series_name COLLATE NOCASE"
             ).fetchall()
-        }
-        total_count = sum(type_counts.values())
-        wishlist_count = db.execute(
-            "SELECT COUNT(*) as c FROM items WHERE owned = 0"
-        ).fetchone()["c"]
-        owned_count = total_count - wishlist_count
+        ]
+
+        # Cross-filter dropdown counts — `locations`, `type_counts`,
+        # `location_counts`, `reading_status_counts`, `owned_count`,
+        # `wishlist_count` and `filtered_total` all come from here.
+        counts = items_common.filter_counts(db, values, total_filtered)
+
+        # Deliberately still global (design §5): none of these appears in
+        # `fragments/filter_counts_oob.html`, so none can diverge.
         lent_out_count = db.execute(
             "SELECT COUNT(DISTINCT item_id) as c FROM checkouts WHERE checked_in IS NULL"
         ).fetchone()["c"]
-        location_counts = {
-            row["location_id"]: row["c"]
-            for row in db.execute(
-                "SELECT location_id, COUNT(*) as c FROM items WHERE location_id IS NOT NULL GROUP BY location_id"
-            ).fetchall()
-        }
-        no_location_count = db.execute(
-            "SELECT COUNT(*) as c FROM items WHERE location_id IS NULL"
-        ).fetchone()["c"]
-        reading_status_counts = {
-            row["reading_status"]: row["c"]
-            for row in db.execute(
-                "SELECT reading_status, COUNT(*) as c FROM items WHERE reading_status IS NOT NULL AND reading_status != '' GROUP BY reading_status"
-            ).fetchall()
-        }
 
         from app.routers.tags import get_all_tags
         all_tags = get_all_tags(db)
 
+        # Languages present in the library — the filter only renders/offers
+        # what actually exists.
+        item_languages = [
+            row["language"]
+            for row in db.execute(
+                "SELECT DISTINCT language FROM items "
+                "WHERE language IS NOT NULL AND language != '' ORDER BY language"
+            ).fetchall()
+        ]
+
         has_more = len(items) < total_filtered
 
-        view = "list" if view == "list" else "grid"
-        load_more_url = build_browse_url(
-            q=q,
-            media_type_filter=media_type_filter,
-            location_filter=location_filter,
-            sort=sort,
-            reading_status=reading_status,
-            owned=owned,
-            lent_out=lent_out,
-            tag=tag,
-            view=view,
-            page=2,
+        load_more_url = "/api/search?" + browse_filters.querystring(
+            values, extra=["page=2"]
         )
+
+    ctx = {
+        "items": items,
+        "media_types": MEDIA_TYPES,
+        "series_names": series_names,
+        "all_tags": all_tags,
+        "lent_out_count": lent_out_count,
+        "item_languages": item_languages,
+        "has_more": has_more,
+        "has_filters": browse_filters.has_active_filters(values),
+        "load_more_url": load_more_url,
+        "seven_days_ago": (datetime.now(tz=None) - timedelta(days=7)).strftime("%Y-%m-%d"),
+        "initial_query": values["q"],
+        "initial_filters": {name: values[name] for name in browse_filters.FILTER_NAMES},
+    }
+    # `render_oob_counts` is deliberately NOT set: `browse.html` includes
+    # `fragments/filter_counts_oob.html` via the item grid, and setting it
+    # would emit a second copy of every filter `<select>` into this page.
+    ctx.update(counts)
 
     return request.app.state.templates.TemplateResponse(
         request,
         "browse.html",
-        {
-            "items": items,
-            "media_types": MEDIA_TYPES,
-            "locations": locations,
-            "type_counts": type_counts,
-            "all_tags": all_tags,
-            "total_count": total_filtered if any([q, media_type_filter, location_filter, reading_status, owned, lent_out, tag]) else total_count,
-            "owned_count": owned_count,
-            "wishlist_count": wishlist_count,
-            "lent_out_count": lent_out_count,
-            "location_counts": location_counts,
-            "no_location_count": no_location_count,
-            "reading_status_counts": reading_status_counts,
-            "has_more": has_more,
-            "has_filters": any([q, media_type_filter, location_filter, reading_status, owned, lent_out, tag]),
-            "load_more_url": load_more_url,
-            "view": view,
-            "seven_days_ago": (datetime.now(tz=None) - timedelta(days=7)).strftime("%Y-%m-%d"),
-            "initial_query": q,
-            "initial_filters": {
-                "media_type_filter": media_type_filter,
-                "location_filter": location_filter,
-                "sort": sort,
-                "reading_status": reading_status,
-                "owned": owned,
-                "lent_out": lent_out,
-                "tag": tag,
-            },
-        },
+        ctx,
     )
 
 
@@ -208,12 +162,19 @@ async def intake(request: Request, _=Depends(require_role("editor"))):
     return request.app.state.templates.TemplateResponse(
         request,
         "intake.html",
-        {"locations": locations, "vision_provider": provider},
+        {"locations": locations, "vision_provider": provider,
+         "media_types": MEDIA_TYPES},
     )
 
 
 @router.get("/item/{item_id}")
-async def item_detail(request: Request, item_id: int, _=Depends(require_role("viewer"))):
+async def item_detail(
+    request: Request,
+    item_id: int,
+    from_: str = Query("", alias="from"),
+    _=Depends(require_role("viewer")),
+):
+    back = nav.back_target(from_)
     with get_db() as db:
         item = db.execute(
             "SELECT i.*, l.name as location_name FROM items i "
@@ -271,12 +232,42 @@ async def item_detail(request: Request, item_id: int, _=Depends(require_role("vi
         item_tags = get_item_tags(db, item_id)
         all_tags = get_all_tags(db)
 
+        reading_history = get_reading_history(db, item_id)
+
+        # Series progress from two labelled sources: local siblings and the
+        # Hardcover series_meta row. Never blended into one number — see
+        # .devdocs plan §4. NOCASE identity, matching /api/series/check, the
+        # series_meta key, and (since this branch) /series's own grouping.
+        series_progress = None
+        if item["series_name"] and item["series_name"].strip():
+            siblings = db.execute(
+                "SELECT owned, series_position FROM items "
+                "WHERE series_name = ? COLLATE NOCASE",
+                (item["series_name"],),
+            ).fetchall()
+            positions = [r["series_position"] for r in siblings]
+            whole = [int(p) for p in positions
+                     if p is not None and float(p).is_integer() and float(p) >= 1]
+            meta = db.execute(
+                "SELECT hc_total, hc_missing, hc_checked_at FROM series_meta "
+                "WHERE name = ? COLLATE NOCASE",
+                (item["series_name"],),
+            ).fetchone()
+            series_progress = {
+                "count": len(siblings),
+                "owned": sum(1 for r in siblings if r["owned"]),
+                "top": max(whole) if whole else None,
+                "gaps": find_gaps(positions),
+                "hc_total": meta["hc_total"] if meta else None,
+            }
+
     return request.app.state.templates.TemplateResponse(
         request,
         "item_detail.html",
         {
             "item": item,
             "item_id": item_id,
+            "back": back,
             "item_tags": item_tags,
             "all_tags": all_tags,
             "media_types": MEDIA_TYPES,
@@ -289,12 +280,20 @@ async def item_detail(request: Request, item_id: int, _=Depends(require_role("vi
             "linked_items": linked_items,
             "linked_abs_items": linked_abs_items,
             "abs_url": abs_url,
+            "reading_history": reading_history,
+            "series_progress": series_progress,
         },
     )
 
 
 @router.get("/item/{item_id}/edit")
-async def item_edit(request: Request, item_id: int, _=Depends(require_role("editor"))):
+async def item_edit(
+    request: Request,
+    item_id: int,
+    from_: str = Query("", alias="from"),
+    _=Depends(require_role("editor")),
+):
+    back = nav.back_target(from_)
     with get_db() as db:
         item = db.execute("SELECT * FROM items WHERE id = ?", (item_id,)).fetchone()
         locations = db.execute(
@@ -306,7 +305,7 @@ async def item_edit(request: Request, item_id: int, _=Depends(require_role("edit
     return request.app.state.templates.TemplateResponse(
         request,
         "item_edit.html",
-        {"item": item, "media_types": MEDIA_TYPES, "game_platforms": game_platforms, "locations": locations},
+        {"item": item, "back": back, "media_types": MEDIA_TYPES, "game_platforms": game_platforms, "locations": locations},
     )
 
 
@@ -337,7 +336,7 @@ async def stats(request: Request, _=Depends(require_role("viewer"))):
             "ORDER BY i.created_at DESC LIMIT 20"
         ).fetchall()
 
-        # --- Dashboard chart data (see docs/plans/STATS_DASHBOARD.md) ---
+        # --- Dashboard chart data (see .devdocs/archive/completed/STATS_DASHBOARD.md) ---
         read_by_year = db.execute(
             "SELECT substr(date_finished, 1, 4) as y, COUNT(*) as c FROM items "
             "WHERE reading_status = 'read' AND date_finished IS NOT NULL "
@@ -356,8 +355,8 @@ async def stats(request: Request, _=Depends(require_role("viewer"))):
             "ORDER BY created_at"
         ).fetchall()
         current_value = db.execute(
-            "SELECT COALESCE(SUM(estimated_value), 0) as v FROM items "
-            "WHERE estimated_value IS NOT NULL"
+            "SELECT COALESCE(SUM(COALESCE(manual_value, estimated_value)), 0) as v FROM items "
+            "WHERE COALESCE(manual_value, estimated_value) IS NOT NULL"
         ).fetchone()["v"]
 
     from datetime import date as _date
@@ -386,8 +385,13 @@ async def stats(request: Request, _=Depends(require_role("viewer"))):
         read_pairs, empty_message="Mark books as read (with a finish date) to build this chart")
     chart_growth = charts.area_chart(growth_pairs, empty_message="No items yet")
     chart_authors = charts.hbar_chart(top_authors, empty_message="No authors yet")
+    currency = get_currency()
+    if currency.suffix:
+        chart_value_prefix, chart_value_suffix = "", " " + currency.symbol
+    else:
+        chart_value_prefix, chart_value_suffix = currency.symbol, ""
     chart_valuation = (
-        charts.area_chart(valuation_pairs, value_prefix="$",
+        charts.area_chart(valuation_pairs, value_prefix=chart_value_prefix, value_suffix=chart_value_suffix,
                           empty_message="Run a batch valuation to start tracking value over time")
         if len(valuation_pairs) >= 2 else None
     )
@@ -472,28 +476,80 @@ async def logs(
     )
 
 
+BORROWER_ERROR_MESSAGES = {
+    "active": "That borrower still has an active loan — check the item in before removing them.",
+}
+
+
 @router.get("/settings")
 async def settings(request: Request, _=Depends(require_role("admin"))):
-    from app.config import is_env_override
+    from app.config import SECRET_ENV_VARS, is_env_override
     from app.database import get_all_settings
+    from app.nav import hideable_tab_states
+    from app.services import cover_queue
+    # Known codes only — never reflect the raw query param into the template.
+    borrower_error_message = BORROWER_ERROR_MESSAGES.get(request.query_params.get("borrower_error"))
     with get_db() as db:
         settings = get_all_settings(db)
         locations = db.execute(
             "SELECT * FROM locations ORDER BY sort_order, name"
         ).fetchall()
         item_count = db.execute("SELECT COUNT(*) as c FROM items").fetchone()["c"]
-        borrowers = db.execute("SELECT * FROM borrowers ORDER BY name").fetchall()
+        missing_covers = db.execute(
+            "SELECT COUNT(*) AS c FROM items WHERE cover_path IS NULL"
+        ).fetchone()["c"]
+        cover_queue_stats = cover_queue.stats()
+        # Carries each borrower's *returned* loan count for the delete
+        # confirmation's copy. Returned rows only: the dialog fires before the
+        # POST, so before the active-loan guard — counting an open loan here
+        # would tell the user a current loan is a "past loan record".
+        borrowers = db.execute(
+            "SELECT b.*, "
+            "COALESCE(SUM(CASE WHEN c.checked_in IS NOT NULL THEN 1 ELSE 0 END), 0) "
+            "AS returned_loan_count "
+            "FROM borrowers b "
+            "LEFT JOIN checkouts c ON c.borrower_id = b.id "
+            "GROUP BY b.id ORDER BY b.name"
+        ).fetchall()
         game_platforms_list = db.execute(
             "SELECT * FROM game_platforms ORDER BY sort_order, name"
         ).fetchall()
         share_links = db.execute(
             "SELECT * FROM share_links ORDER BY created_at DESC"
         ).fetchall()
-    env_overrides = {k for k in settings if is_env_override(k)}
+    # Iterate the env map, not `settings`: `get_all_settings` carries only keys
+    # with a row, so an env-only credential is absent from it (G15) and a
+    # comprehension over it can never see one. Keys here — `is_env_override`
+    # takes a settings key, not a shell variable name.
+    env_overrides = {k for k in SECRET_ENV_VARS if is_env_override(k)}
+    # Both inputs to each hideable tab's visibility, for the Navigation card.
+    # Deliberately called with no argument: `settings` above comes from
+    # `get_all_settings`, which only carries keys that have a row in the
+    # table — a credential supplied purely by env var (HARDCOVER_TOKEN) is
+    # missing from it, and the card would claim Discover is unconfigured
+    # while the nav bar shows it. The no-arg path reads the same env-aware
+    # snapshot the nav itself uses.
+    hideable_nav_tab_states = hideable_tab_states()
     # Never hand decrypted credentials to the template — it only needs to know
     # whether one is saved. Fields are write-only; blank submit keeps the value.
     from app.crypto import SENSITIVE_KEYS
+    # Two flags, because for an env-only credential these differ. `secrets_saved`
+    # means "there is a row in `settings`" — the right question for the clear
+    # checkbox (only a row can be deleted) and the "Saved" placeholder.
     secrets_saved = {k: bool(settings.get(k)) for k in SENSITIVE_KEYS}
+    # `secrets_present` means "a credential is available", which an env var
+    # supplies with no row at all (G15, issue #39). It gates the Test buttons and
+    # — via `data-abs-saved` — Audiobookshelf's Sync Now (issue #41), which reads
+    # availability because /stream syncs from the stored credentials and never
+    # from the form. It deliberately does not feed the clear checkbox: making
+    # `secrets_saved` itself env-aware would offer a "Remove saved key" checkbox
+    # that cannot remove an env credential.
+    secrets_present = {k: secrets_saved[k] or k in env_overrides for k in SENSITIVE_KEYS}
+    # `abs_url` needs its own flag: it has a SECRET_ENV_VARS entry but is not a
+    # SENSITIVE_KEY (it is not a credential), so `secrets_present` has no member
+    # for it — and both Audiobookshelf actions gate on the URL: Test on typed-or-
+    # present, Sync Now on presence alone (issue #41).
+    abs_url_present = bool(settings.get("abs_url")) or "abs_url" in env_overrides
     for k in SENSITIVE_KEYS:
         if k in settings:
             settings[k] = ""
@@ -501,6 +557,10 @@ async def settings(request: Request, _=Depends(require_role("admin"))):
         request,
         "settings.html",
         {"settings": settings, "locations": locations, "item_count": item_count, "share_links": share_links,
-         "borrowers": borrowers, "env_overrides": env_overrides, "secrets_saved": secrets_saved,
-         "game_platforms_list": game_platforms_list},
+         "borrowers": borrowers, "secrets_saved": secrets_saved,
+         "secrets_present": secrets_present, "abs_url_present": abs_url_present,
+         "game_platforms_list": game_platforms_list,
+         "hideable_nav_tab_states": hideable_nav_tab_states,
+         "borrower_error_message": borrower_error_message,
+         "missing_covers": missing_covers, "cover_queue_stats": cover_queue_stats},
     )

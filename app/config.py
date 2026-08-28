@@ -1,10 +1,5 @@
-import logging
 import os
 from pathlib import Path
-
-import httpx
-
-logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DATABASE_PATH = DATA_DIR / "shelf.db"
@@ -72,6 +67,15 @@ OPENAI_DEFAULT_INGEST_LONG_EDGE = 2048
 # the tiling offer appear. Below it the single-image path runs unchanged.
 TILING_THRESHOLD = 1.5
 
+# Absolute source long-edge (pixels) below which a photo is flagged low-res,
+# separate from the tiling decision. A 1080p video-track grab (1920) and a
+# messaging-app-recompressed library photo fall below it; a native phone
+# still (>=3000) sits above it. This is absolute source pixels, not a ratio
+# to the provider cap -- a ratio would double-fire with the tiling card in
+# the [1.5, 2) factor band and mis-fire on the Anthropic high-res 2576 cap
+# and on operator-raised Ollama caps.
+LOW_RES_LONG_EDGE = 2400
+
 # Directional overlap: vertical cut lines bisect spines, so they get generous
 # overlap; horizontal cuts run between shelf rows and need little.
 TILE_OVERLAP_X = 0.12  # fraction of tile width
@@ -95,66 +99,56 @@ VISION_PRICING = {
     "haiku": (1.00, 5.00),
 }
 VISION_PRICING_DEFAULT = (5.00, 25.00)
-PROMPT_OVERHEAD_TOKENS = 300  # system-ish prompt + JSON schema scaffolding
-TOKENS_PER_BOOK = 40  # ~1 JSON row of title + authors
+PROMPT_OVERHEAD_TOKENS = 500  # unified spine+cover prompt + JSON schema scaffolding
+TOKENS_PER_BOOK = 60  # ~1 JSON row, e.g. {"title": "Dune", "authors": "Frank Herbert", "isbn": "9780441172719", "source": "read"}
 EXPECTED_BOOKS_PER_MEGAPIXEL = 8  # rough spine density for output estimate
 EXPECTED_BOOKS_MIN = 20
 EXPECTED_BOOKS_MAX = 200
 
-OPENLIBRARY_RATE_LIMIT = 0.34  # seconds between requests (~3/sec)
-HARDCOVER_RATE_LIMIT = 1.0  # seconds between requests (60/min API limit)
+# Minimum seconds between requests to a given outbound host, enforced by
+# app.services.outbound.acquire(). A host that is absent means "no pacing"
+# (interval 0.0) — that is the correct entry for LAN/self-hosted targets and
+# for hosts that publish no limit, not an oversight.
+#
+# Read this table as `app.config.HOST_RATE_LIMITS` at call time. A
+# `from app.config import HOST_RATE_LIMITS` freezes the reference at import
+# and breaks test overrides (the "Config import trap" in CLAUDE.md); tests
+# override single hosts with monkeypatch.setitem.
+HOST_RATE_LIMITS: dict[str, float] = {
+    # Open Library grants 1 req/s by default and 3 req/s to requests that
+    # identify themselves with an app name AND contact information
+    # (https://openlibrary.org/developers/api). openlibrary.py sends a
+    # contact URL in its User-Agent, so 3/s applies. If that header ever
+    # loses its contact info, this must drop to 1.0.
+    "openlibrary.org": 0.34,
+    # Two services behind one host: CoverID/OLID-keyed URLs are unlimited,
+    # every other key (ISBN, LCCN, OCLC) is capped at 100 requests per IP
+    # per 5 minutes and returns 403 past it
+    # (https://openlibrary.org/dev/docs/api/covers). 403 is not transient,
+    # so exceeding this reads as "no cover found" and fails silently — a
+    # per-host interval cannot tell the two key types apart, so pace for the
+    # limited one. Do not lower below 3.0.
+    "covers.openlibrary.org": 3.0,
+    "services.dnb.de": 1.0,  # DNB SRU catalog — good citizenship
+    "portal.dnb.de": 1.0,  # DNB cover host, same citizenship
+    "api.hardcover.app": 1.0,  # 60/min API limit
+    "api2.isbndb.com": 3.0,  # was isbndb's own 3s post-request sleep
+    "www.googleapis.com": 0.25,  # Google Books quota is per-day; light pacing only
+    "images-na.ssl-images-amazon.com": 0.5,  # image CDN; politeness only
+    "api.igdb.com": 0.25,  # IGDB publishes 4 req/s
+    "api.themoviedb.org": 0.1,  # no hard per-second cap
+    # EXPLORER (the keyless trial tier this client uses) allows 6 lookups per
+    # minute and 100 per day; faster than the burst rate is declined with 429
+    # (https://www.upcitemdb.com/wp/docs/main/development/api-rate-limits/).
+    # 1.0 permitted 60/min — ten times the ceiling — so a run of scans bought
+    # 429s that read to the user as "not found". Do not lower below 10.0
+    # without moving off the trial tier.
+    "api.upcitemdb.com": 10.0,
+}
 
 # HTTP client defaults
 HTTP_TIMEOUT = 15  # seconds for external API calls
 DEFAULT_PAGE_SIZE = 60
-
-
-def _env_float(name: str, default: float) -> float:
-    """Read a positive timeout value without making a bad env var fatal."""
-    try:
-        value = float(os.environ.get(name, default))
-        return value if value > 0 else default
-    except (TypeError, ValueError):
-        return default
-
-
-# Metadata calls use bounded phase-specific timeouts. Cover fetches are kept
-# shorter because they happen after usable metadata has already been found.
-METADATA_HTTP_TIMEOUT = httpx.Timeout(
-    connect=_env_float("METADATA_CONNECT_TIMEOUT", 3.0),
-    read=_env_float("METADATA_READ_TIMEOUT", 7.0),
-    write=_env_float("METADATA_WRITE_TIMEOUT", 7.0),
-    pool=_env_float("METADATA_POOL_TIMEOUT", 7.0),
-)
-COVER_HTTP_TIMEOUT = httpx.Timeout(
-    connect=_env_float("COVER_CONNECT_TIMEOUT", 2.0),
-    read=_env_float("COVER_READ_TIMEOUT", 4.0),
-    write=_env_float("COVER_WRITE_TIMEOUT", 4.0),
-    pool=_env_float("COVER_POOL_TIMEOUT", 4.0),
-)
-
-
-def metadata_provider_order() -> tuple[str, ...]:
-    """Return the configured, validated metadata provider sequence."""
-    default = ("openlibrary", "hardcover", "google")
-    raw = os.environ.get("METADATA_PROVIDER_ORDER")
-    if not raw:
-        return default
-    requested = tuple(part.strip().lower() for part in raw.split(",") if part.strip())
-    unknown = tuple(dict.fromkeys(part for part in requested if part not in default))
-    duplicates = tuple(dict.fromkeys(part for part in requested if requested.count(part) > 1))
-    if unknown or duplicates:
-        details = []
-        if unknown:
-            details.append(f"unknown providers: {', '.join(unknown)}")
-        if duplicates:
-            details.append(f"duplicate providers: {', '.join(duplicates)}")
-        logger.warning(
-            "Invalid METADATA_PROVIDER_ORDER (%s); using each recognized provider once in first-listed order",
-            "; ".join(details),
-        )
-    valid = tuple(dict.fromkeys(part for part in requested if part in default))
-    return valid or default
 
 # Auth
 SECRET_KEY = os.environ.get("SECRET_KEY", "")  # auto-generated and stored in DB if empty

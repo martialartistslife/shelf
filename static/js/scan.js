@@ -1,7 +1,11 @@
 function scanPage() {
     return {
         mode: localStorage.getItem('shelf_scan_mode') || 'add',
-        mediaType: localStorage.getItem('shelf_media_type') || 'book',
+        // Auto for a *new* user. A stored value is deliberately never
+        // migrated: "book" is also what someone who scans books chose, and
+        // reinterpreting that as "no choice" is guessing at intent. The
+        // barcode rule (§1) is what reaches those users instead.
+        mediaType: localStorage.getItem('shelf_media_type') || 'auto',
         platform: localStorage.getItem('shelf_platform') || '',
         location: localStorage.getItem('shelf_location') || '',
         borrowerId: '',
@@ -13,6 +17,7 @@ function scanPage() {
         lastScanned: '',
         lastScanTime: 0,
         inventoryScannedIds: [],
+        isZxingFallback: false,
 
         modes: [
             {id: 'add', label: 'Add'},
@@ -118,16 +123,26 @@ function scanPage() {
                 this.cameraActive = true;
                 this.scanPaused = false;
                 this.scanResult = false;
+
+                this.scanner = window.createBarcodeScanner({
+                    html5ElId: 'camera-reader',
+                    videoEl: 'zxing-video',
+                    html5Config: { fps: 10, qrbox: { width: 280, height: 100 }, aspectRatio: 1.5 },
+                    onDecode: (decodedText) => this.onScan(decodedText)
+                });
+                this.isZxingFallback = this.scanner.engine === 'zxing';
+                this.scanLoading = this.isZxingFallback;
+
+                // Let the paired x-show containers settle before the engine
+                // grabs its target element.
                 await this.$nextTick();
-                this.scanner = new Html5Qrcode('camera-reader');
-                await this.scanner.start(
-                    { facingMode: 'environment' },
-                    { fps: 10, qrbox: { width: 280, height: 100 }, aspectRatio: 1.5 },
-                    (decodedText) => this.onScan(decodedText),
-                    () => {}
-                );
+
+                await this.scanner.start();
+                this.scanLoading = false;
             } catch (err) {
+                this.scanner = false;
                 this.cameraActive = false;
+                this.scanLoading = false;
                 if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
                     showToast('Camera requires HTTPS. Access Shelf via https:// and accept the certificate.', 'error');
                 } else {
@@ -138,7 +153,7 @@ function scanPage() {
 
         async stopCamera() {
             if (this.scanner) {
-                try { await this.scanner.stop(); } catch(e) {}
+                await this.scanner.stop();
                 this.scanner = false;
             }
             this.cameraActive = false;
@@ -151,7 +166,7 @@ function scanPage() {
             this.scanLoading = false;
             this.lastScanned = '';
             try {
-                this.scanner.resume();
+                if (this.scanner) await this.scanner.resume();
             } catch (err) {}
             this.scanPaused = false;
         },
@@ -178,7 +193,9 @@ function scanPage() {
             this.scanPaused = true;
             this.scanLoading = true;
             this.scanResult = false;
-            try { await this.scanner.pause(true); } catch(e) {}
+            if (this.scanner) {
+                try { await this.scanner.pause(); } catch(e) {}
+            }
 
             // Beep
             try {
@@ -208,25 +225,21 @@ function scanPage() {
                 results.insertAdjacentHTML('afterbegin', html);
                 htmx.process(results.firstElementChild);
 
-                // Parse the result to show in overlay
+                // Parse the result to show in overlay. scanCardOutcome (app.js)
+                // reads the card's own data-scan-* attributes; it is the same
+                // reader the typed/Enter toast uses, so the two paths cannot
+                // drift apart the way two class-substring parsers did.
                 var tmp = document.createElement('div');
                 tmp.innerHTML = html;
-                var titleEl = tmp.querySelector('.font-medium');
-                var authorsEl = tmp.querySelector('.text-sm.text-shelf-muted');
-                var coverEl = tmp.querySelector('img');
-                var badgeEl = tmp.querySelector('span[class*="rounded-full"]');
-                var badge = badgeEl ? badgeEl.textContent.trim() : '';
-
-                var ok = html.includes('bg-shelf-success') || html.includes('bg-blue-500') || html.includes('bg-orange-500') || html.includes('bg-purple-500');
-                var warn = html.includes('bg-shelf-warning');
+                var outcome = scanCardOutcome(tmp.querySelector('.scan-result'));
 
                 this.scanResult = {
-                    ok: ok,
-                    warn: warn,
-                    label: badge || 'done',
-                    title: titleEl ? titleEl.textContent.trim() : null,
-                    authors: authorsEl ? authorsEl.textContent.trim() : null,
-                    cover: coverEl ? coverEl.getAttribute('src').replace(/^\//, '') : null,
+                    ok: outcome.ok,
+                    warn: outcome.warn,
+                    label: outcome.label || 'done',
+                    title: outcome.title,
+                    authors: outcome.authors,
+                    cover: outcome.cover ? outcome.cover.replace(/^\//, '') : null,
                     isbn: code
                 };
 

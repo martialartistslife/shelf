@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: 'Required immutable/versioned image tag (for example: 0.2.0-custom.1)'
+        description: 'Required immutable/versioned image tag (for example: 0.22.3-custom.1)'
         required: true
         type: string
 

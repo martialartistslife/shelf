@@ -8,9 +8,10 @@ from fastapi.responses import HTMLResponse
 from starlette.responses import StreamingResponse
 
 from app.auth import require_role
-from app.config import MEDIA_TYPES
-from app.database import get_db, get_all_settings
-from app.services import isbndb
+from app.config import HTTP_TIMEOUT, MEDIA_TYPES
+from app.currency import format_money
+from app.database import get_db, get_setting
+from app.services import isbndb, tmdb
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +30,7 @@ async def test_isbndb_key(request: Request, _=Depends(require_role("admin"))):
 
     if not api_key:
         with get_db() as db:
-            settings = get_all_settings(db)
-        api_key = settings.get("isbndb_api_key", "")
+            api_key = get_setting(db, "isbndb_api_key") or ""
 
     if not api_key:
         return {"ok": False, "message": "No key configured"}
@@ -65,29 +65,20 @@ async def test_tmdb_key(request: Request, _=Depends(require_role("admin"))):
         pass
 
     if not api_key:
+        # get_setting, not get_all_settings: the latter returns only keys that
+        # have a settings row, so an install configured purely by TMDB_API_KEY
+        # would report "No key configured" while real scans authenticate fine
+        # (G15). Every credential read in this file now uses get_setting for
+        # the same reason — the ISBNdb ones were reachable env-only from #39
+        # onward, once the UI stopped gating them on a stored row.
         with get_db() as db:
-            settings = get_all_settings(db)
-        api_key = settings.get("tmdb_api_key", "")
+            api_key = get_setting(db, "tmdb_api_key") or ""
 
     if not api_key:
         return {"ok": False, "message": "No key configured"}
 
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                "https://api.themoviedb.org/3/search/movie",
-                params={"api_key": api_key, "query": "The Matrix"},
-                timeout=10,
-            )
-        if resp.status_code == 200:
-            count = resp.json().get("total_results", 0)
-            return {"ok": True, "message": f"Key is valid ({count} results)"}
-        elif resp.status_code == 401:
-            return {"ok": False, "message": "Invalid API key"}
-        else:
-            return {"ok": False, "message": f"Unexpected response: HTTP {resp.status_code}"}
-    except Exception:
-        return {"ok": False, "message": "Connection failed — check network"}
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        return await tmdb.test_key(api_key, client)
 
 
 @router.post("/valuate/{item_id:int}")
@@ -95,12 +86,11 @@ async def valuate_item(item_id: int, _=Depends(require_role("admin"))):
     """Look up price for a single item."""
     with get_db() as db:
         item = db.execute("SELECT isbn FROM items WHERE id = ?", (item_id,)).fetchone()
-        settings = get_all_settings(db)
+        api_key = get_setting(db, "isbndb_api_key")
 
     if not item or not item["isbn"]:
         return {"ok": False, "message": "No ISBN"}
 
-    api_key = settings.get("isbndb_api_key")
     if not api_key:
         return {"ok": False, "message": "ISBNdb API key not configured"}
 
@@ -143,9 +133,8 @@ async def valuate_all(_=Depends(require_role("admin"))):
         items = db.execute(
             "SELECT id, isbn FROM items WHERE isbn IS NOT NULL"
         ).fetchall()
-        settings = get_all_settings(db)
+        api_key = get_setting(db, "isbndb_api_key")
 
-    api_key = settings.get("isbndb_api_key")
     if not api_key:
         return {"ok": False, "message": "ISBNdb API key not configured"}
 
@@ -183,9 +172,8 @@ async def valuate_all_stream(request: Request, _=Depends(require_role("admin")))
         items = db.execute(
             "SELECT id, isbn, title FROM items WHERE isbn IS NOT NULL"
         ).fetchall()
-        settings = get_all_settings(db)
+        api_key = get_setting(db, "isbndb_api_key")
 
-    api_key = settings.get("isbndb_api_key")
     if not api_key:
         async def error_stream():
             yield f"data: {json.dumps({'type': 'error', 'message': 'ISBNdb API key not configured'})}\n\n"
@@ -209,7 +197,7 @@ async def valuate_all_stream(request: Request, _=Depends(require_role("admin")))
                             )
                         results["priced"] += 1
                         results["total_value"] += price
-                        status = f"${price:.2f}"
+                        status = format_money(price)
                     else:
                         results["not_found"] += 1
                         status = "no price"
@@ -217,13 +205,17 @@ async def valuate_all_stream(request: Request, _=Depends(require_role("admin")))
                     await queue.put({
                         "type": "progress", "current": i, "total": len(items),
                         "title": item["title"] or item["isbn"], "status": status,
+                        "priced": bool(price),
                     })
                     if i % 20 == 0:
                         isbndb._save_cache(cache)
 
             isbndb._save_cache(cache)
             _snapshot_valuation()
-            await queue.put({"type": "done", **results})
+            await queue.put({
+                "type": "done", **results,
+                "total_display": format_money(results["total_value"]),
+            })
         except Exception:
             logger.exception("Valuation failed")
             isbndb._save_cache(cache)
@@ -253,16 +245,19 @@ async def valuation_report(request: Request, _=Depends(require_role("viewer"))):
 
     with get_db() as db:
         items = db.execute(
-            "SELECT i.*, l.name as location_name FROM items i "
+            "SELECT i.*, l.name as location_name, "
+            "COALESCE(i.manual_value, i.estimated_value) AS effective_value "
+            "FROM items i "
             "LEFT JOIN locations l ON i.location_id = l.id "
             "ORDER BY (l.name IS NULL), l.name COLLATE NOCASE, "
-            "(i.estimated_value IS NULL), i.estimated_value DESC, i.title COLLATE NOCASE"
+            "(COALESCE(i.manual_value, i.estimated_value) IS NULL), "
+            "COALESCE(i.manual_value, i.estimated_value) DESC, i.title COLLATE NOCASE"
         ).fetchall()
         total_with_isbn = db.execute("SELECT COUNT(*) as c FROM items WHERE isbn IS NOT NULL").fetchone()["c"]
 
     total_items = len(items)
-    priced = [i for i in items if i["estimated_value"]]
-    total_value = sum(i["estimated_value"] for i in priced)
+    priced = [i for i in items if i["effective_value"]]
+    total_value = sum(i["effective_value"] for i in priced)
     avg_price = total_value / len(priced) if priced else 0
     unpriced = total_items - len(priced)
     estimated_missing = avg_price * unpriced
@@ -276,8 +271,8 @@ async def valuation_report(request: Request, _=Depends(require_role("viewer"))):
             location_groups.append({"name": name, "items": [], "subtotal": 0.0, "priced_count": 0})
         group = location_groups[-1]
         group["items"].append(item)
-        if item["estimated_value"]:
-            group["subtotal"] += item["estimated_value"]
+        if item["effective_value"]:
+            group["subtotal"] += item["effective_value"]
             group["priced_count"] += 1
 
     from datetime import date

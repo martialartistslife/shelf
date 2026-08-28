@@ -1,4 +1,5 @@
 import logging
+import re
 import sqlite3
 from contextlib import contextmanager
 from typing import Sequence
@@ -90,6 +91,52 @@ MIGRATIONS: Sequence[tuple[int, str, str]] = (
     (12, "Add scan_log mode column",          "ALTER TABLE scan_log ADD COLUMN mode TEXT DEFAULT 'add'"),
     (13, "Add users token_version column",    "ALTER TABLE users ADD COLUMN token_version INTEGER NOT NULL DEFAULT 1"),
     (14, "Add abs_library_id column",         "ALTER TABLE items ADD COLUMN abs_library_id TEXT DEFAULT NULL"),
+    (15, "Add manual_value column",           "ALTER TABLE items ADD COLUMN manual_value REAL DEFAULT NULL"),
+    (16, "Add series_meta complete column",   "ALTER TABLE series_meta ADD COLUMN complete INTEGER DEFAULT NULL"),
+    (17, "Add series_meta hc_total column",   "ALTER TABLE series_meta ADD COLUMN hc_total INTEGER DEFAULT NULL"),
+    (18, "Add series_meta hc_missing column", "ALTER TABLE series_meta ADD COLUMN hc_missing INTEGER DEFAULT NULL"),
+    (19, "Add series_meta hc_checked_at column", "ALTER TABLE series_meta ADD COLUMN hc_checked_at TEXT DEFAULT NULL"),
+    # 20-21 re-file barcodes landed in the wrong column before #20 was fixed.
+    # Both are plain UPDATEs rather than schema changes, and both are written
+    # to be idempotent + collision-safe: _backfill_versions() replays every
+    # migration on a pre-version-tracking database and only swallows
+    # OperationalError, so an IntegrityError here would abort startup.
+    (20, "Canonicalize UPC codes to EAN-13",
+     """UPDATE items SET upc = '0' || upc
+        WHERE upc IS NOT NULL AND length(upc) = 12
+          AND NOT EXISTS (SELECT 1 FROM items o
+                          WHERE o.upc = '0' || items.upc
+                            AND o.media_type = items.media_type)"""),
+    (21, "Re-file UPC barcodes stored in the isbn column",
+     """UPDATE items SET upc = isbn, isbn = NULL, isbn10 = NULL
+        WHERE upc IS NULL AND isbn IS NOT NULL AND length(isbn) = 13
+          AND isbn NOT LIKE '978%' AND isbn NOT LIKE '979%'
+          AND NOT EXISTS (SELECT 1 FROM items o
+                          WHERE o.upc = items.isbn
+                            AND o.media_type = items.media_type)"""),
+    (22, "Add language column", "ALTER TABLE items ADD COLUMN language TEXT DEFAULT NULL"),
+    (23, "Backfill language from ISBN registration group",
+     """UPDATE items SET language = CASE
+            WHEN substr(isbn, 1, 5) = '97910' THEN 'fr'
+            WHEN substr(isbn, 1, 5) = '97884' THEN 'es'
+            WHEN substr(isbn, 1, 5) = '97885' THEN 'pt'
+            WHEN substr(isbn, 1, 5) = '97887' THEN 'da'
+            WHEN substr(isbn, 1, 5) = '97888' THEN 'it'
+            WHEN substr(isbn, 1, 5) = '97912' THEN 'it'
+            WHEN substr(isbn, 1, 5) = '97890' THEN 'nl'
+            WHEN substr(isbn, 1, 5) = '97891' THEN 'sv'
+            WHEN substr(isbn, 1, 5) = '97911' THEN 'ko'
+            WHEN substr(isbn, 1, 4) = '9780' THEN 'en'
+            WHEN substr(isbn, 1, 4) = '9781' THEN 'en'
+            WHEN substr(isbn, 1, 4) = '9798' THEN 'en'
+            WHEN substr(isbn, 1, 4) = '9782' THEN 'fr'
+            WHEN substr(isbn, 1, 4) = '9783' THEN 'de'
+            WHEN substr(isbn, 1, 4) = '9784' THEN 'ja'
+            WHEN substr(isbn, 1, 4) = '9785' THEN 'ru'
+            WHEN substr(isbn, 1, 4) = '9787' THEN 'zh'
+            ELSE NULL
+        END
+        WHERE language IS NULL AND isbn IS NOT NULL"""),
 )
 
 MIGRATION_TABLES = """
@@ -197,27 +244,92 @@ CREATE TABLE IF NOT EXISTS item_tags (
     PRIMARY KEY (item_id, tag_id)
 );
 CREATE INDEX IF NOT EXISTS idx_item_tags_tag ON item_tags(tag_id);
+
+-- complete/hc_total/hc_missing/hc_checked_at are also added via ALTER in
+-- MIGRATIONS (16-19) for upgrades of a database that already has this
+-- table; baked in here too (same pattern as users.token_version above) so a
+-- brand-new database gets them immediately — on first boot the MIGRATIONS
+-- ALTERs run before this script creates the table, so they're no-ops here.
+CREATE TABLE IF NOT EXISTS series_meta (
+    name          TEXT PRIMARY KEY COLLATE NOCASE,
+    description   TEXT,
+    source        TEXT,
+    updated_at    TEXT,
+    complete      INTEGER DEFAULT NULL,
+    hc_total      INTEGER DEFAULT NULL,
+    hc_missing    INTEGER DEFAULT NULL,
+    hc_checked_at TEXT DEFAULT NULL
+);
 """
 
 
-def _backfill_versions(db: sqlite3.Connection) -> set[int]:
-    """Detect already-applied migrations in pre-version-tracking databases."""
+# Last migration that shipped before the loop became atomic (issue #24).
+# Only these could have applied their ALTER without recording it, so only
+# these may be legitimately replayed.
+_PRE_ATOMIC_MAX_VERSION = 21
+
+
+def _is_benign_migration_error(version: int, exc: sqlite3.OperationalError) -> bool:
+    """True for the two ways a migration can fail harmlessly and still count
+    as applied. Everything else is a defect in the migration SQL and must
+    reach the caller instead of being silently recorded.
+
+    Matching on the message alone is not enough: a typo'd table name produces
+    the same "no such table" as a table MIGRATION_TABLES has not created yet,
+    and a migration that re-adds an existing base column produces the same
+    "duplicate column name" as an interrupted replay. Both are bound here to
+    the invariant that actually makes them benign.
+    """
+    msg = str(exc)
+    if "duplicate column name" in msg:
+        return version <= _PRE_ATOMIC_MAX_VERSION
+    match = re.search(r"no such table: (?:\w+\.)?(\w+)", msg)
+    if match:
+        # G1: every MIGRATION_TABLES CREATE bakes in the columns its ALTERs
+        # add, and it runs after the migration loop — so for the tables it
+        # manages the ALTER is redundant by design and recording the version
+        # is correct. A table it will not create is a typo or a removed
+        # table; recording that would make the divergence permanent.
+        return f"CREATE TABLE IF NOT EXISTS {match.group(1)}" in MIGRATION_TABLES
+    return False
+
+
+def _backfill_versions(db: sqlite3.Connection) -> tuple[set[int], str]:
+    """Detect already-applied migrations in pre-version-tracking databases.
+
+    Returns the applied versions and a log line for the caller to emit later
+    (see _run_migrations for why nothing is logged from in here).
+    """
     applied = set()
     for version, description, sql in MIGRATIONS:
         try:
             db.execute(sql)
-        except sqlite3.OperationalError:
-            pass  # column already exists — migration was previously applied
+        except sqlite3.OperationalError as e:
+            # Already applied, or the table is one MIGRATION_TABLES creates
+            # complete below. Anything else is a genuine defect and must not
+            # be recorded as applied.
+            if not _is_benign_migration_error(version, e):
+                raise
         applied.add(version)
         db.execute(
             "INSERT INTO schema_version (version, description) VALUES (?, ?)",
             (version, description),
         )
-    logger.info("Backfilled %d migration version records", len(applied))
-    return applied
+    return applied, f"Backfilled {len(applied)} migration version records"
 
 
-def _run_migrations(db: sqlite3.Connection) -> None:
+def _run_migrations(db: sqlite3.Connection) -> list[str]:
+    """Apply pending migrations. Returns log lines for the caller to emit.
+
+    Nothing here logs directly, and callers must emit the returned lines only
+    after this connection's transaction has committed. SQLiteHandler writes
+    every log record to the log_entries table on a *second* connection to this
+    same database, so a log call from inside the migration write transaction
+    waits out SQLite's full busy timeout and then fails — five pending
+    migrations meant ~25s of startup and five tracebacks that looked, to
+    anyone upgrading, exactly like a failed migration.
+    """
+    logs: list[str] = []
     applied = {
         r["version"]
         for r in db.execute("SELECT version FROM schema_version").fetchall()
@@ -225,20 +337,54 @@ def _run_migrations(db: sqlite3.Connection) -> None:
 
     if not applied:
         # First run with version tracking — detect already-applied migrations
-        applied = _backfill_versions(db)
+        applied, backfill_log = _backfill_versions(db)
+        logs.append(backfill_log)
     else:
         for version, description, sql in MIGRATIONS:
             if version in applied:
                 continue
-            db.execute(sql)
+            # One transaction per migration, so the schema change and the row
+            # that records it commit together or not at all.
+            #
+            # Without this, a migration's ALTER could land while its
+            # schema_version row did not, wedging the database permanently
+            # (issue #24). The mechanism is narrower than it looks: under
+            # sqlite3's default (legacy) transaction control an implicit
+            # transaction is opened before DML only, never before DDL. So an
+            # ALTER issued while no transaction was open ran in autocommit and
+            # landed alone, while its INSERT opened a transaction that stayed
+            # pending until the executescript below — which is why only the
+            # *first* pending migration wedged and every later one in the same
+            # run rolled back cleanly.
+            db.execute("BEGIN IMMEDIATE")
+            # Re-read under the write lock. `applied` was sampled before the
+            # loop, so it is stale if another runner (a concurrent boot, or a
+            # restore migrating the live database) committed this version
+            # while we waited for the lock.
+            if db.execute(
+                "SELECT 1 FROM schema_version WHERE version = ?", (version,)
+            ).fetchone():
+                db.commit()
+                continue
+            try:
+                db.execute(sql)
+            except sqlite3.OperationalError as e:
+                if not _is_benign_migration_error(version, e):
+                    raise
+                # An earlier interrupted run already applied this ALTER but
+                # never recorded it, or MIGRATION_TABLES creates the table
+                # complete below. Either way it counts as applied, exactly as
+                # _backfill_versions already does.
             db.execute(
                 "INSERT INTO schema_version (version, description) VALUES (?, ?)",
                 (version, description),
             )
-            logger.info("Applied migration %d: %s", version, description)
+            db.commit()
+            logs.append(f"Applied migration {version}: {description}")
 
     db.executescript(MIGRATION_TABLES)
     _seed_game_platforms(db)
+    return logs
 
 
 def _seed_game_platforms(db: sqlite3.Connection) -> None:
@@ -283,11 +429,7 @@ def get_all_settings(db) -> dict[str, str]:
         if val and r["key"] in SENSITIVE_KEYS:
             val = decrypt_value(val, secret)
         settings[r["key"]] = val
-    # Include environment-only credentials even when the setting has never
-    # been persisted (environment overrides must not require a placeholder row).
-    from app.config import SECRET_ENV_VARS
-    return {k: get_setting_value(k, settings.get(k))
-            for k in settings.keys() | SECRET_ENV_VARS.keys()}
+    return {k: get_setting_value(k, v) for k, v in settings.items()}
 
 
 def get_game_platforms(db) -> dict[str, str]:
@@ -298,12 +440,72 @@ def get_game_platforms(db) -> dict[str, str]:
     return {r["slug"]: r["name"] for r in rows}
 
 
+def get_reading_history(db, item_id: int) -> list:
+    """Every reading_log row for an item, newest first.
+
+    Read-only; rendered by fragments/reading_status.html from BOTH of its
+    renderers — pages.item_detail and items.set_reading_status. Wiring only
+    one of them leaves the fragment's history silently empty after an HTMX
+    status toggle.
+
+    No LIMIT: the "Read N times" heading must be the true count, and a
+    per-item row count is bounded by human reading. Rows are not filtered by
+    status — the app only ever inserts 'read', and archive-imported rows
+    should render too. Indexed by idx_reading_log_item.
+    """
+    return db.execute(
+        "SELECT id, status, date_started, date_finished FROM reading_log "
+        "WHERE item_id = ? ORDER BY date_finished DESC, id DESC",
+        (item_id,),
+    ).fetchall()
+
+
+def gc_orphaned_series_meta(db, *names: str | None) -> None:
+    """Delete series_meta rows for any of the given series names that no
+    longer have any item pointing at them (case-insensitive, matching the
+    NOCASE collation on both series_meta.name and series_name usage).
+
+    Pass the OLD series name(s) a write just moved items away from — a
+    series_meta row can only go orphaned when its name stops being
+    referenced, so there's never a reason to GC a brand-new name.
+
+    Call this against the same `db` connection/transaction that performed
+    the items UPDATE, and only after that UPDATE has executed. SQLite
+    connections see their own uncommitted writes, so this does not need to
+    wait for get_db()'s commit-on-exit — but it does need the UPDATE to have
+    already run on this connection, or the "still referenced?" check below
+    will see stale rows.
+
+    Modeled on the tag GC in app/routers/tags.py's remove_tag().
+    """
+    seen: set[str] = set()
+    for name in names:
+        if not name:
+            continue
+        key = name.strip().casefold()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        db.execute(
+            "DELETE FROM series_meta WHERE name = ? COLLATE NOCASE "
+            "AND NOT EXISTS ("
+            "SELECT 1 FROM items WHERE series_name = ? COLLATE NOCASE"
+            ")",
+            (name, name),
+        )
+
+
 def init_db():
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
     COVERS_DIR.mkdir(parents=True, exist_ok=True)
     with get_db() as db:
         db.executescript(SCHEMA)
-        _run_migrations(db)
+        migration_logs = _run_migrations(db)
+    # Only now, with the migration transaction committed and its connection
+    # closed, is it safe for SQLiteHandler to open its own connection and
+    # write these records to log_entries.
+    for line in migration_logs:
+        logger.info("%s", line)
 
 
 @contextmanager

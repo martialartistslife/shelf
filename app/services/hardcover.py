@@ -1,29 +1,19 @@
 """Hardcover.app GraphQL API client for book metadata and library sync."""
 
-import asyncio
 import logging
-import time
+from collections.abc import Callable
 
 import httpx
 
-from app.config import METADATA_HTTP_TIMEOUT
-from app.services.isbn import isbn13_to_isbn10
+from app.services import outbound
 
 logger = logging.getLogger(__name__)
 
 API_URL = "https://api.hardcover.app/v1/graphql"
-RATE_LIMIT = 1.0  # seconds between requests (60/min limit, stay safe at 1/sec)
-
-_last_request = 0.0
 
 
 async def _rate_limit():
-    global _last_request
-    now = time.monotonic()
-    wait = RATE_LIMIT - (now - _last_request)
-    if wait > 0:
-        await asyncio.sleep(wait)
-    _last_request = time.monotonic()
+    await outbound.acquire("api.hardcover.app")
 
 
 async def _graphql(
@@ -31,8 +21,15 @@ async def _graphql(
     variables: dict | None = None,
     token: str | None = None,
     client: httpx.AsyncClient | None = None,
+    *,
+    on_rate_limit: Callable[[], None] | None = None,
 ) -> dict | None:
-    """Execute a GraphQL query against Hardcover. Returns data dict or None on error."""
+    """Execute a GraphQL query against Hardcover. Returns data dict or None on error.
+
+    `on_rate_limit`, when given, is called once if the provider answered 429.
+    Defaulting to `None` keeps every existing caller byte-identical. Only
+    `lookup_by_isbn` forwards this — every other caller here passes nothing.
+    """
     await _rate_limit()
     headers = {"Content-Type": "application/json"}
     if token:
@@ -50,7 +47,9 @@ async def _graphql(
     if own_client:
         client = httpx.AsyncClient(timeout=30)
     try:
-        resp = await client.post(API_URL, json=payload, headers=headers, timeout=METADATA_HTTP_TIMEOUT)
+        resp = await client.post(API_URL, json=payload, headers=headers)
+        if on_rate_limit is not None and outbound.is_rate_limited(resp):
+            on_rate_limit()
         if resp.status_code != 200:
             logger.debug("Hardcover API returned HTTP %d", resp.status_code)
             return None
@@ -81,8 +80,15 @@ async def test_connection(token: str) -> dict:
     return {"ok": False, "message": "Invalid token or connection failed"}
 
 
-async def lookup_by_isbn(isbn: str, client: httpx.AsyncClient, token: str | None = None) -> dict | None:
-    """Look up a book by ISBN via Hardcover editions table. Returns metadata dict or None."""
+async def lookup_by_isbn(
+    isbn: str, client: httpx.AsyncClient, token: str | None = None,
+    *, on_rate_limit: Callable[[], None] | None = None,
+) -> dict | None:
+    """Look up a book by ISBN via Hardcover editions table. Returns metadata dict or None.
+
+    `on_rate_limit`, when given, is forwarded to both `_graphql` calls below —
+    the ISBN-13 attempt and the ISBN-10 retry — and so may fire from either.
+    """
     # Try ISBN-13 first, then ISBN-10
     query = """
     query ($isbn: String!) {
@@ -108,14 +114,13 @@ async def lookup_by_isbn(isbn: str, client: httpx.AsyncClient, token: str | None
     }
     """
 
-    data = await _graphql(query, {"isbn": isbn}, token=token, client=client)
+    data = await _graphql(query, {"isbn": isbn}, token=token, client=client, on_rate_limit=on_rate_limit)
     if not data or not data.get("editions"):
         # Try as ISBN-10
-        isbn10 = isbn13_to_isbn10(isbn)
-        if not isbn10:
-            return None
         query_10 = query.replace("isbn_13", "isbn_10")
-        data = await _graphql(query_10, {"isbn": isbn10}, token=token, client=client)
+        data = await _graphql(
+            query_10, {"isbn": isbn}, token=token, client=client, on_rate_limit=on_rate_limit
+        )
         if not data or not data.get("editions"):
             return None
 
@@ -548,7 +553,7 @@ async def sync_reading_statuses(token: str) -> dict:
     return {"updated": updated, "unchanged": unchanged, "total": len(linked)}
 
 
-# --- Series completeness (see docs/plans/SERIES_TRACKING.md) ---
+# --- Series completeness (see .devdocs/archive/completed/SERIES_TRACKING.md) ---
 
 
 def _parse_series_entries(entries: list) -> list[dict]:
@@ -679,4 +684,42 @@ async def get_series_books(series_name: str, token: str, client: httpx.AsyncClie
         entries = (data["series"][0] or {}).get("book_series") or []
         return _parse_series_entries(entries) or None
 
+    return None
+
+
+async def get_series_description(series_name: str, token: str, client: httpx.AsyncClient | None = None) -> str | None:
+    """Fetch a series' own synopsis from Hardcover, if any.
+
+    Deliberately separate from get_series_books rather than threading a second
+    return value through its intricate parsing pipeline (_parse_series_entries).
+    Best-effort only: schema drift (Hardcover rejects the `description` field),
+    a lookup failure, or a missing/blank synopsis all fall through to None via
+    _graphql's existing error handling — never raises, and never disturbs the
+    book-listing completeness check.
+
+    Hardcover routinely carries SEVERAL series rows under the same name (three
+    "Hyperion Cantos", three "Dune", ...), and usually only one of them — not
+    necessarily the first — has a description. So fetch the matches and take the
+    first non-empty one rather than trusting `limit: 1`; verified against a real
+    library where limit-1 missed a synopsis that did exist.
+
+    Returns None when no match has a description. Most Hardcover series simply
+    have none (44 of 49 in that same library), so a None here is the normal
+    case, not a malfunction — callers should say so rather than reporting an
+    error.
+    """
+    query = """
+    query ($name: String!) {
+      series(where: { name: { _eq: $name } }, limit: 25) {
+        description
+      }
+    }
+    """
+    data = await _graphql(query, {"name": series_name}, token=token, client=client)
+    if not data or not data.get("series"):
+        return None
+    for entry in data["series"]:
+        description = (entry or {}).get("description")
+        if isinstance(description, str) and description.strip():
+            return description.strip()
     return None

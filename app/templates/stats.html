@@ -18,7 +18,7 @@
     </div>
     <div class="bg-shelf-card border border-shelf-border rounded-lg p-5">
         <p class="text-shelf-muted text-sm">Est. Value</p>
-        <p class="text-3xl font-bold">{% if current_value %}${{ '{:,.0f}'.format(current_value) }}{% else %}—{% endif %}</p>
+        <p class="text-3xl font-bold">{% if current_value %}{{ current_value|money(0) }}{% else %}—{% endif %}</p>
     </div>
     <div class="bg-shelf-card border border-shelf-border rounded-lg p-5">
         <p class="text-shelf-muted text-sm">With Covers</p>
@@ -106,7 +106,7 @@
     <h2 class="text-lg font-semibold mb-4">Recently Added (Last 30 Days)</h2>
     <div class="space-y-2">
         {% for item in recent %}
-        <a href="/item/{{ item.id }}" class="flex items-center gap-3 p-2 rounded hover:bg-shelf-hover transition-colors">
+        <a href="/item/{{ item.id }}?from=stats" class="flex items-center gap-3 p-2 rounded hover:bg-shelf-hover transition-colors">
             {% if item.cover_path %}
             <img src="/{{ item.cover_path }}" alt="" class="w-8 h-12 object-cover rounded">
             {% else %}

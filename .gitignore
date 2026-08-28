@@ -2,6 +2,13 @@ data/
 data-dev/
 .env
 __pycache__/
-docs/
+.devdocs
 .coverage
+reports/
 htmlcov/
+.claude
+.codex/
+.agents/
+# Node build tooling (tailwind CLI) — see package.json
+node_modules/
+.temp/

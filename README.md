@@ -3,6 +3,8 @@
 [![Release](https://img.shields.io/github/v/release/dgahagan/shelf)](https://github.com/dgahagan/shelf/releases)
 [![Docker Pulls](https://img.shields.io/docker/pulls/dangahagan/shelf)](https://hub.docker.com/r/dangahagan/shelf)
 [![CI](https://github.com/dgahagan/shelf/actions/workflows/test.yml/badge.svg)](https://github.com/dgahagan/shelf/actions/workflows/test.yml)
+[![Unit tests](https://img.shields.io/badge/unit%20tests-1938%20passing-brightgreen)](https://github.com/dgahagan/shelf/actions/workflows/test.yml)
+[![E2E tests](https://img.shields.io/badge/e2e%20tests-218%20passing-brightgreen)](https://github.com/dgahagan/shelf/actions/workflows/test.yml)
 [![License: AGPL-3.0](https://img.shields.io/github/license/dgahagan/shelf)](LICENSE)
 
 A self-hosted home library catalog with barcode scanning, multi-mode scanning workflows, automatic metadata lookup, cover art, and collection management — all in a single Docker container.
@@ -17,8 +19,9 @@ A self-hosted home library catalog with barcode scanning, multi-mode scanning wo
 
 Most home library apps are cloud-hosted, mobile-only, or require you to manually enter every book. Shelf takes a different approach:
 
-- **Scan and done** — point your phone camera at a barcode or use a USB/Bluetooth barcode scanner and the book is cataloged in seconds, complete with cover art, author, series info, and description. Works out of the box with any scanner that sends Enter after the barcode (most do by default)
-- **Bulk-add from a photo** — snap a picture of a full shelf and a vision model reads the spines. Review the detected titles, then import them all with full metadata and covers. Works with the Anthropic API, any OpenAI-compatible endpoint, or a fully local Ollama model
+- **Scan and done** — point your phone camera at a barcode or use a USB/Bluetooth barcode scanner and the book is cataloged in seconds, complete with cover art, author, series info, and description. Works out of the box with any scanner that sends Enter after the barcode (most do by default), and camera scanning works on iPhones and iPads as well as Android
+- **Bulk-add from a photo** — snap a picture of a full shelf, a stack, or books laid face-up, and a vision model reads the spines and recognizes the covers. Review the candidate list — each row carries the ISBN read off a back cover, a per-row media type, and a marker on rows the model recognized rather than read — then import them all. Works with the Anthropic API, any OpenAI-compatible endpoint, or a fully local Ollama model
+- **The barcode decides the media type** — an ISBN is a book even if the dropdown still says DVD, and a game UPC reaches IGDB even if it says Book. Leave it on **Auto** and scan a mixed pile; the card says what it detected and why, and says plainly when a record came back thin — because a provider key is missing, was rejected, is rate-limiting you right now, has no source for that format yet, or simply had no match
 - **8 scan modes** — Add, Wishlist, Lend, Return, Move, Inventory, Lookup, and Quick Rate. The scan tab adapts to whatever you're doing: adding new items, lending to a friend, reorganizing shelves, or auditing a room
 - **Title search** — don't have a barcode? Search by title across Open Library (books), TMDb (movies), and IGDB (video games) and add directly from results
 - **Zero cloud dependency** — runs entirely on your network in a single Docker container with a SQLite database. Your data never leaves your home
@@ -48,9 +51,17 @@ Most home library apps are cloud-hosted, mobile-only, or require you to manually
 |------------------|---------------------|
 | ![Valuation Report](screenshots/valuation-report.png) | ![Tag Filter](screenshots/browse-tag-filter.png) |
 
-| Photo Intake |
-|--------------|
-| ![Photo Intake](screenshots/photo-intake.png) |
+| Photo Intake | Series |
+|--------------|--------|
+| ![Photo Intake](screenshots/photo-intake.png) | ![Series](screenshots/series.png) |
+
+## Documentation
+
+Full docs live in [`docs/`](docs/README.md):
+
+- [Installation](docs/installation.md) · [Configuration](docs/configuration.md) · [HTTPS & reverse proxy](docs/https-and-reverse-proxy.md) · [Upgrading & backups](docs/upgrading-and-backups.md)
+- **User guide:** [Getting started](docs/user-guide/getting-started.md) · [Scanning](docs/user-guide/scanning.md) · [Photo Intake](docs/user-guide/photo-intake.md) · [Browse](docs/user-guide/browse-and-search.md) · [Items](docs/user-guide/items.md) · [Series](docs/user-guide/series.md) · [Lending](docs/user-guide/lending.md) · [Wishlist & Store Mode](docs/user-guide/wishlist-and-store-mode.md) · [Sharing](docs/user-guide/sharing.md) · [Stats & valuation](docs/user-guide/stats-and-valuation.md) · [Import & export](docs/user-guide/import-and-export.md) · [Integrations](docs/user-guide/integrations.md) · [Users & roles](docs/user-guide/users-and-roles.md)
+- [FAQ](docs/faq.md) · [Troubleshooting](docs/troubleshooting.md) · [Development](docs/development.md) · [Architecture](docs/architecture.md)
 
 ## Quick Start
 
@@ -66,7 +77,7 @@ Create a `.env` file alongside `docker-compose.yml` for host-specific config:
 
 ```bash
 # Add your machine's IP so you can access Shelf from other devices
-CERT_SAN=IP:192.168.1.50,DNS:shelf,DNS:localhost
+CERT_SAN=IP:192.168.1.100,DNS:shelf,DNS:localhost
 ```
 
 | Variable | Default | Description |
@@ -74,8 +85,6 @@ CERT_SAN=IP:192.168.1.50,DNS:shelf,DNS:localhost
 | `CERT_SAN` | `DNS:shelf,DNS:localhost` | TLS certificate Subject Alternative Names |
 | `SECRET_KEY` | *(auto-generated)* | JWT signing key (auto-generated and stored in DB if not set) |
 | `SHELF_ENCRYPTION_KEY` | *(auto-generated)* | Encryption key for stored API credentials. Auto-generated at `data/encryption.key` if not set — never stored in the DB, so backups contain ciphertext only. Set it (e.g. `openssl rand -hex 32`) so the data directory alone can't decrypt credentials |
-| `GOOGLE_BOOKS_API_KEY` | *(unset)* | Optional Google Books API key; overrides the encrypted Settings value |
-| `OPENLIBRARY_CONTACT` | *(unset)* | Contact email for Open Library request identification and its higher identified-client rate limit |
 
 ### Data
 
@@ -95,10 +104,12 @@ data/
 ### Scanning and Metadata
 - **Camera barcode scanning** on mobile — tap to scan ISBNs and UPCs
 - **8 scan modes** — Add, Wishlist, Lend, Return, Move, Inventory, Lookup, and Quick Rate
-- **Photo intake** — bulk-add books from a photo of your shelves using a vision model (see [Photo Intake](#photo-intake))
+- **Media-type detection** — the barcode outranks the scan form's dropdown when it is certain; Auto reads the barcode and decides
+- **Photo intake** — bulk-add books from a photo of your shelves using a vision model, snapped with the phone or webcam or uploaded (see [Photo Intake](#photo-intake))
 - **Title search** — search Open Library, TMDb, or IGDB by title when you don't have a barcode
-- **Cascading metadata lookup** — Open Library, Hardcover, and Google Books
-- **Cover art pipeline** — Open Library, Hardcover, Amazon, Google Books, IGDB, and manual upload/search
+- **Cascading metadata lookup** — Open Library, Hardcover, and Google Books, with German (978-3) ISBNs routed through the Deutsche Nationalbibliothek (DNB) first
+- **Edition language** — captured on lookup, editable on items, filterable in Browse; a settings dropdown picks the preferred language for title searches
+- **Cover art pipeline** — Open Library, Hardcover, DNB (German ISBNs), Amazon, Google Books, IGDB, and manual search/upload/remove, on any item. Cover search is media-type aware: books search Google Books and Open Library, DVDs the film's TMDb poster set, video games IGDB cover art and artwork
 - **UPC support** — scan DVDs and Blu-rays with TMDb lookup
 - **Video game support** — scan UPC barcodes for modern games or search IGDB by title for retro cartridges. Platform tracking with a customizable platform list (30+ platforms from Atari 2600 to PS5)
 
@@ -115,17 +126,27 @@ data/
 | **Lookup** | Scan to check if an item is in your collection — no changes made |
 | **Quick Rate** | Scan to mark items as read/completed |
 
+Camera scanning picks its decoder to suit the device: iOS Safari drives the
+camera with ZXing, every other platform uses html5-qrcode. The scan page and
+Store Mode share one engine, so both behave the same everywhere. Retail
+barcodes are covered — EAN-13, EAN-8, UPC-A and UPC-E. USB and Bluetooth
+scanners bypass the camera entirely and work regardless.
+
 ### Photo Intake
 
 <p align="center">
   <img src="screenshots/photo-intake.png" width="700" alt="Photo Intake — reviewing books detected from a shelf photo">
 </p>
 
-Snap a photo of a shelf and Shelf reads the spines. Open **Photo Intake** in
-the nav, upload the photo, and the detected books appear as an editable
-candidate list — nothing is imported until you confirm. Confirmed rows run
-through the normal metadata pipeline, so they arrive with full metadata and
-cover art, and an author-match guard keeps wrong editions from slipping in.
+Snap a photo of a shelf — or of books stacked or laid face-up — and Shelf
+reads the spines it can read and recognizes the covers it can't. Open
+**Photo Intake** in the nav, take or upload the photo, and the detected books appear
+as an editable candidate list: title, author, the ISBN read off a back cover
+if one was in frame, a per-row media type, and a marker on rows identified
+from the cover rather than read. Nothing is imported until you confirm.
+Rows with an ISBN then get the same lookup a barcode scan does; the rest are
+matched on title and author behind an author-match guard, and the Done panel
+shows which rows found no metadata.
 
 Configure a vision backend under Settings → Integrations → Photo Intake:
 
@@ -152,9 +173,13 @@ each option before anything is sent.
 - **Checkout system** — lend to borrowers with the Lend scan mode, filter by "Lent Out" in browse
 - **Loan reminders** — overdue loans get a red badge, and an optional daily digest (ntfy or webhook) nags you about them; configure under Settings → Library → Lending
 - **Wishlist** — mark items as unowned to build a wish list alongside your catalog
-- **Series tracking** — a Series page groups your library by series with position numbers, flags likely gaps, and (with Hardcover configured) checks the full series and adds missing volumes to your wishlist in one click
+- **Series tracking** — a Series page groups your library by series with position numbers, flags likely gaps, and (with Hardcover configured) checks the full series and adds missing volumes to your wishlist in one click. Each series can carry its own synopsis, written inline or fetched from Hardcover. Rename a series (renaming onto an existing name merges the two — the quick fix for duplicate series records left by metadata lookup) or disband it entirely, right from the series card
+- **Bulk editing** — select multiple items in Browse to move them, change type or reading status, or set and clear their series in one go
+- **Choose your columns** — Browse's list view has a column picker (value, series, publisher, year, pages, language, added date, platform, ISBN/UPC, and more), on top of the author/type/location/status shown by default; the choice is remembered per browser, not per account
 - **Valuation report** — location-grouped, print-ready report of your collection's list-price value for insurance documentation ([print view](screenshots/valuation-report-print.png)); prices via ISBNdb
+- **Display currency** — pick from 20 currencies under Settings → Collection and every value surface follows. This is formatting, not conversion: Shelf never converts amounts between currencies, so the figure ISBNdb returns is the figure shown
 - **CSV import/export** — bulk operations and backups
+- **Portable archive** — export your whole collection as a single zip (items, tags, locations, series, reading log, checkouts, **and your cover art**) and merge it back into any Shelf instance without refetching a single cover. No credentials or instance-specific data are included, so it's the safe way to move servers or hand your library to someone else — unlike a database backup, which carries password hashes and encrypted API keys but no covers at all. Importing previews first: you see how many items are new, how many are already yours, how each duplicate was matched (exactly on ISBN, or heuristically on title and author), and you can leave parts of the archive out before anything is written
 - **Goodreads & StoryGraph migration** — upload your library export as-is; the format is auto-detected, reading statuses and owned/wishlist flags are mapped, and covers are fetched automatically
 - **Store Mode (offline PWA)** — scan barcodes in a bookstore with no signal and get an instant Owned / On wishlist / Not in library verdict; unknown books queue on-device and are added to your wishlist automatically when you're back online (see [Store Mode](#store-mode-offline-pwa))
 
@@ -165,6 +190,12 @@ each option before anything is sent.
 - **[ISBNdb](https://isbndb.com)** — collection valuation with list prices for insurance documentation
 
 ### Store Mode (Offline PWA)
+
+<p align="center">
+  <img src="screenshots/store-mode.gif" width="420" alt="Store Mode demo — three ISBNs checked in turn, returning Owned, On wishlist, and Not in library with the unknown book queued for sync">
+</p>
+
+<p align="center"><em>Standing in the shop: scan, and know instantly whether you already own it.</em></p>
 
 Open **Store** in the nav (or visit `/store`), and Shelf caches your library's
 ISBNs on the device. From then on, scanning a barcode answers instantly from
@@ -218,7 +249,7 @@ marked `noindex`, and revocable at any time.
 | Role | Can do |
 |------|--------|
 | **Admin** | Everything: settings, users, locations, sync, bulk ops, logs |
-| **Editor** | Add/edit/delete items, scan (all modes), manage covers, checkout/checkin, import/export |
+| **Editor** | Add/edit/delete items, scan (all modes), covers (find/upload/remove), checkout/checkin, import/export |
 | **Viewer** | Browse, search, reading status, export CSV, view stats |
 
 ## Metadata Sources
@@ -228,22 +259,11 @@ Shelf queries free, public APIs to look up book and game information — no API 
 | Source | What it provides | API key required? |
 |--------|-----------------|-------------------|
 | [Open Library](https://openlibrary.org) | Title, author, description, cover art, publish info, title search | No |
-| [Google Books](https://books.google.com) | Fallback metadata and cover art | Google Books API key |
+| [Google Books](https://books.google.com) | Fallback metadata and cover art | No (optional key supported) |
 | [Amazon Images](https://www.amazon.com) | Fallback cover art via ISBN | No |
 | [UPC Item DB](https://www.upcitemdb.com) | Title lookup from UPC barcodes (games, DVDs) | No |
 
 Metadata lookups send only the ISBN or UPC to these services. No personal data, account info, or collection details are transmitted.
-
-For self-hosted deployments, `METADATA_PROVIDER_ORDER` can override the default
-`openlibrary,hardcover,google` sequence. Metadata request phases default to a
-3-second connect timeout and 7-second read/write/pool timeouts; override them
-with `METADATA_CONNECT_TIMEOUT`, `METADATA_READ_TIMEOUT`,
-`METADATA_WRITE_TIMEOUT`, and `METADATA_POOL_TIMEOUT`. Cover requests use the
-shorter `COVER_CONNECT_TIMEOUT` (2 seconds) and `COVER_READ_TIMEOUT`,
-`COVER_WRITE_TIMEOUT`, and `COVER_POOL_TIMEOUT` (4 seconds) settings.
-Set `OPENLIBRARY_CONTACT` to a deployer-controlled email address or URL to
-identify your Shelf instance to Open Library and use its identified-client
-request rate. Without it, Shelf uses Open Library's slower anonymous rate.
 
 ## Optional API Keys
 
@@ -252,14 +272,17 @@ Configure in Settings to unlock additional features:
 | Service | Enables | Link |
 |---------|---------|------|
 | **Hardcover** | Reading status sync, richer metadata, import/export, Discover page | [hardcover.app](https://hardcover.app) |
+| **Google Books** | Optional credentialed metadata, synopsis, and cover requests; anonymous access remains available | [Google Books API](https://developers.google.com/books) |
 | **IGDB** (Twitch) | Video game metadata, cover art, and platform info | [dev.twitch.tv/console](https://dev.twitch.tv/console) |
 | **ISBNdb** | Collection valuation with market prices | [isbndb.com](https://isbndb.com) |
 | **TMDb** | DVD/Blu-ray metadata and title search via UPC barcode | [themoviedb.org](https://www.themoviedb.org) |
-| **Anthropic** | Photo Intake spine recognition (best accuracy) | [console.anthropic.com](https://console.anthropic.com) |
+| **Anthropic** | Photo Intake — reads spines and recognizes covers (best accuracy) | [console.anthropic.com](https://console.anthropic.com) |
 | **OpenAI-compatible** | Photo Intake via any OpenAI Chat Completions endpoint (OpenAI, OpenRouter, vLLM, LM Studio…) | [platform.openai.com](https://platform.openai.com) |
 | **Ollama** | Photo Intake with a fully local vision model — no key needed | [ollama.com](https://ollama.com) |
 
 ## Development
+
+See [docs/development.md](docs/development.md) for the full guide and [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR. The essentials:
 
 ```bash
 # Rebuild after code changes
@@ -299,6 +322,8 @@ make install-playwright   # downloads headless Chromium
 | `make check-secrets` | Scan tracked files for accidentally hardcoded secrets |
 | `make check-csrf` | Lint that raw `fetch()` calls send the CSRF token |
 | `make check-alpine` | Verify templates stay compatible with the Alpine CSP build |
+| `make check-sw-version` | Verify the service worker's cache version matches what it caches |
+| `make check-tests` | Lint the test suite's own conventions |
 | `make checks` | All of the checks above |
 | `make report-review` | Code review report via Claude agent |
 | `make report-security` | Security audit report via Claude agent |
@@ -314,12 +339,12 @@ make install-playwright   # downloads headless Chromium
 
 ```bash
 make qa          # run tests, checks, and generate reports
-# review docs/CODE_REVIEW_*.md, SECURITY_AUDIT_*.md, TEST_AUDIT_*.md
+# review reports/CODE_REVIEW_*.md, SECURITY_AUDIT_*.md, TEST_AUDIT_*.md
 make fix         # Claude reads reports and applies fixes interactively
 make verify      # confirm all tests still pass
 ```
 
-Reports land in `docs/` with today's date (e.g. `docs/CODE_REVIEW_2026-03-27.md`) and are gitignored — they're regenerated each QA cycle.
+Reports land in `reports/` with today's date (e.g. `reports/CODE_REVIEW_2026-03-27.md`) and are gitignored — they're regenerated each QA cycle, so keep a copy elsewhere if you want to compare against a previous run.
 
 Report targets default to `claude-sonnet-4-6`. Override with `MODEL=` for a deeper pre-release audit:
 

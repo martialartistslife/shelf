@@ -1,3 +1,5 @@
+import json
+import sqlite3
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, Form, Request
@@ -6,8 +8,10 @@ from fastapi.responses import RedirectResponse, FileResponse
 from app.auth import require_role
 from app.config import DATABASE_PATH, DATA_DIR
 from app.crypto import SENSITIVE_KEYS, encrypt_value, get_encryption_key
-from app.database import get_db
-from app.database import get_setting
+from app.currency import CURRENCIES, invalidate_cache as invalidate_currency_cache
+from app.database import get_db, get_setting
+from app.nav import HIDEABLE_KEYS, invalidate_cache as invalidate_nav_cache
+from app.services.national import SEARCH_LANGS
 
 router = APIRouter(prefix="/api/settings", dependencies=[Depends(require_role("admin"))])
 
@@ -57,19 +61,22 @@ async def update_settings(request: Request):
             if key == "abs_url":
                 value = value.rstrip("/")
             _upsert_setting(db, key, value, cleared=form.get(f"clear_{key}") == "on")
+    invalidate_nav_cache()  # hardcover_token gates the Discover tab
     return RedirectResponse(url="/settings", status_code=303)
 
 
 @router.post("/google-books/test")
 async def test_google_books(request: Request):
-    """Test the submitted or saved key; service messages never contain it."""
+    """Test a submitted or configured Google Books API key."""
     from app.services import googlebooks
+
     try:
         body = await request.json()
     except Exception:
         return {"ok": False, "message": "Invalid request"}
     if not isinstance(body, dict):
         return {"ok": False, "message": "Invalid request"}
+
     api_key = (body.get("api_key") or "").strip()
     if not api_key:
         with get_db() as db:
@@ -124,6 +131,7 @@ async def update_vision_settings(
             ("ollama_ingest_long_edge", ollama_long_edge),
         ]:
             _upsert_setting(db, key, value, cleared=clears.get(key, False))
+    invalidate_nav_cache()  # the vision provider and its key gate the Intake tab
     return RedirectResponse(url="/settings", status_code=303)
 
 
@@ -154,6 +162,48 @@ async def update_lending_settings(
             ("notify_format", fmt),
         ]:
             _upsert_setting(db, key, value, cleared=clear_notify_url == "on" and key == "notify_url")
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/nav")
+async def update_nav_settings(request: Request):
+    """Save which nav tabs are visible.
+
+    Each hideable tab gets a checkbox that posts "on" when checked (visible).
+    Only keys in HIDEABLE_KEYS are ever considered — a forged 'browse' or
+    'settings' checkbox, or any unknown key, is silently dropped, so those
+    tabs can never end up in the stored hidden list.
+    """
+    form = await request.form()
+    checked = {k for k in form.keys() if k in HIDEABLE_KEYS}
+    hidden = sorted(HIDEABLE_KEYS - checked)
+    with get_db() as db:
+        _upsert_setting(db, "nav_hidden_tabs", json.dumps(hidden))
+    invalidate_nav_cache()
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/display")
+async def update_display_settings(request: Request):
+    """Save the display currency and metadata search language.
+
+    Only writes when the posted code is known — an unknown code is silently
+    dropped, same posture as /nav's key filtering. Currency is display
+    only: Shelf never converts amounts between currencies. The search
+    language steers which language's editions Open Library search prefers.
+    """
+    form = await request.form()
+    code = (form.get("currency") or "").strip().upper()
+    if code in CURRENCIES:
+        with get_db() as db:
+            _upsert_setting(db, "currency", code)
+        invalidate_currency_cache()
+
+    search_lang = (form.get("metadata_search_lang") or "").strip()
+    if search_lang in SEARCH_LANGS:
+        with get_db() as db:
+            _upsert_setting(db, "metadata_search_lang", search_lang)
+
     return RedirectResponse(url="/settings", status_code=303)
 
 
@@ -218,7 +268,6 @@ async def download_backup_encrypted(passphrase: str = Form("")):
 @router.post("/restore")
 async def restore_backup(request: Request):
     """Restore database from uploaded .db file. Requires container restart."""
-    import sqlite3
     form = await request.form()
     db_file = form.get("file")
     if not db_file or not hasattr(db_file, "read"):
@@ -324,10 +373,26 @@ async def restore_backup(request: Request):
         tmp_path.unlink(missing_ok=True)
         return {"ok": False, "message": "Invalid database file — must be a valid Shelf SQLite database"}
 
-    # Replace current database
-    import shutil
-    shutil.copy2(str(tmp_path), str(DATABASE_PATH))
-    tmp_path.unlink(missing_ok=True)
+    # Replace the current database through SQLite, not the filesystem.
+    #
+    # A plain file copy overwrites shelf.db but leaves the live shelf.db-wal
+    # and -shm sidecars in place, and any connection open at that moment
+    # keeps them alive. SQLite then replays that stale WAL over the new file:
+    # either the pre-restore data comes straight back — this endpoint
+    # reporting success while nothing changed — or the mismatch surfaces as
+    # "database disk image is malformed". backup() copies page by page
+    # through SQLite, which holds the right locks and leaves the WAL
+    # consistent with the file it belongs to.
+    src = sqlite3.connect(str(tmp_path))
+    try:
+        dest = sqlite3.connect(str(DATABASE_PATH))
+        try:
+            src.backup(dest)
+        finally:
+            dest.close()
+    finally:
+        src.close()
+        tmp_path.unlink(missing_ok=True)
 
     # Invalidate all existing sessions by bumping every user's token_version.
     # Encrypted settings in the restored DB stay readable because the
@@ -340,5 +405,6 @@ async def restore_backup(request: Request):
     init_db()  # bring an older restored DB up to the current schema first
     with get_db() as db:
         db.execute("UPDATE users SET token_version = token_version + 1")
+    invalidate_nav_cache()  # the restored DB carries its own settings
 
     return {"ok": True, "message": "Database restored. All sessions invalidated. Restart the container to apply."}

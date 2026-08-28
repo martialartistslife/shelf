@@ -1,9 +1,23 @@
 """Tests for the PWA store mode (routers/store.py)."""
+import importlib.util
+import re
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
 from tests.conftest import _insert_item
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SW_PATH = REPO_ROOT / "static" / "sw.js"
+
+# The digest logic lives in the script that stamps SW_VERSION, so the test and
+# the generator cannot disagree about what the version should be. Loaded the
+# same way tests/test_alpine_csp_lint.py loads its lint.
+_SCRIPT = REPO_ROOT / "scripts" / "stamp_sw_version.py"
+_spec = importlib.util.spec_from_file_location("stamp_sw_version", _SCRIPT)
+stamp_sw_version = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(stamp_sw_version)
 
 
 class TestStorePage:
@@ -28,6 +42,76 @@ class TestStorePage:
         resp = admin_client.get("/static/manifest.webmanifest")
         assert resp.status_code == 200
         assert '"start_url": "/store"' in resp.text
+
+
+class TestSwPrecacheDigest:
+    """SW_VERSION is derived, not typed — these are the gate that keeps it so.
+
+    Before Lever 2 this class asserted that a human had performed a three-step
+    ritual (bump SW_VERSION, recompute the digest, re-pin it in a dict). It now
+    asserts the generator ran, which `make css` and `make checks-fast` both do.
+    """
+
+    def test_precache_entries_resolve_to_static_files(self):
+        _version, entries = stamp_sw_version.parse_sw()
+
+        for url_path in entries:
+            # Raises SwParseError with the offending entry if it escapes
+            # static/, contains '..', or does not exist on disk.
+            stamp_sw_version.resolve_entry(url_path)
+
+    def test_sw_version_matches_precache_digest(self):
+        changed, current, expected = stamp_sw_version.stamp(check_only=True)
+
+        assert not changed, (
+            f"SW_VERSION in {SW_PATH} is {current!r} but the precache digest "
+            f"says {expected!r}. A precached file's contents changed (a "
+            "`make css` rebuild of static/css/app.css is the usual cause), or "
+            "SW_VERSION was hand-edited. Fix: run `make css`, then commit "
+            "static/sw.js."
+        )
+
+    def test_stamp_is_idempotent(self, tmp_path, monkeypatch):
+        """Stamping a stale sw.js twice converges — sw.js is not self-precached.
+
+        If sw.js were ever added to PRECACHE, stamping would change the bytes
+        the digest is computed from and never settle. This is the tripwire for
+        that; it fails the moment someone precaches the worker itself.
+        """
+        sw_copy = tmp_path / "sw.js"
+        sw_copy.write_text(SW_PATH.read_text().replace(
+            f"SW_VERSION = '{stamp_sw_version.expected_version()}'",
+            "SW_VERSION = 'vSTALE'",
+        ))
+        monkeypatch.setattr(stamp_sw_version, "SW_PATH", sw_copy)
+
+        first_changed, _current, first_expected = stamp_sw_version.stamp()
+        assert first_changed, "a hand-edited SW_VERSION must be detected as stale"
+
+        second_changed, second_current, _second_expected = stamp_sw_version.stamp()
+        assert not second_changed, (
+            "stamping did not converge — sw.js is probably listed in its own "
+            "PRECACHE, which makes SW_VERSION depend on itself."
+        )
+        assert second_current == first_expected
+
+    def test_hand_edited_version_fails_the_gate(self, tmp_path, monkeypatch):
+        sw_copy = tmp_path / "sw.js"
+        sw_copy.write_text(SW_PATH.read_text().replace(
+            f"SW_VERSION = '{stamp_sw_version.expected_version()}'",
+            "SW_VERSION = 'v9'",
+        ))
+        monkeypatch.setattr(stamp_sw_version, "SW_PATH", sw_copy)
+
+        changed, current, expected = stamp_sw_version.stamp(check_only=True)
+        assert changed and current == "v9" and expected != "v9"
+        # --check must not rewrite the file it is checking.
+        assert "SW_VERSION = 'v9'" in sw_copy.read_text()
+
+    def test_parse_failure_is_loud(self, monkeypatch):
+        """A regex that stops matching must raise, not silently disarm."""
+        with pytest.raises(stamp_sw_version.SwParseError):
+            stamp_sw_version.parse_sw("// no SW_VERSION and no PRECACHE here")
 
 
 class TestStoreData:
@@ -75,8 +159,8 @@ class TestStoreQueue:
         return {"title": title, "authors": "An Author"}
 
     def test_wishlisted_with_metadata(self, admin_client, db):
-        with patch("app.routers.items._lookup_metadata",
-                   new=AsyncMock(return_value=(self._meta(), "openlibrary", {}))), \
+        with patch("app.routers.items_common._lookup_metadata",
+                   new=AsyncMock(return_value=(self._meta(), "openlibrary", {}, False))), \
              patch("app.routers.store.covers.download_cover", new=AsyncMock(return_value=None)):
             resp = admin_client.post("/api/store/queue", json={"isbns": ["9780441013593"]})
         results = resp.json()["results"]
@@ -86,15 +170,16 @@ class TestStoreQueue:
         item = db.execute("SELECT * FROM items WHERE isbn = '9780441013593'").fetchone()
         assert item["owned"] == 0
 
-    def test_passes_effective_google_key(self, admin_client, monkeypatch):
+    def test_google_key_reaches_store_metadata_lookup(self, admin_client, monkeypatch):
         monkeypatch.setenv("GOOGLE_BOOKS_API_KEY", "store-google-key")
-        with patch("app.routers.items._lookup_metadata",
-                   new=AsyncMock(return_value=(None, None, {}))) as lookup:
+        lookup = AsyncMock(return_value=(None, None, {}, False))
+        with patch("app.routers.items_common._lookup_metadata", new=lookup):
             admin_client.post("/api/store/queue", json={"isbns": ["9780900000011"]})
-        assert lookup.await_args.args[3] == "store-google-key"
+
+        assert lookup.await_args.kwargs["google_api_key"] == "store-google-key"
 
     def test_bare_add_when_lookup_fails(self, admin_client, db):
-        with patch("app.routers.items._lookup_metadata",
+        with patch("app.routers.items_common._lookup_metadata",
                    new=AsyncMock(side_effect=Exception("network down"))):
             resp = admin_client.post("/api/store/queue", json={"isbns": ["9780553283686"]})
         results = resp.json()["results"]
@@ -106,8 +191,8 @@ class TestStoreQueue:
         assert "9780553283686" in item["title"]
 
     def test_bare_add_when_nothing_found(self, admin_client, db):
-        with patch("app.routers.items._lookup_metadata",
-                   new=AsyncMock(return_value=(None, None, {}))):
+        with patch("app.routers.items_common._lookup_metadata",
+                   new=AsyncMock(return_value=(None, None, {}, False))):
             resp = admin_client.post("/api/store/queue", json={"isbns": ["9780900000011"]})
         assert resp.json()["results"][0]["status"] == "added_bare"
 
@@ -120,8 +205,8 @@ class TestStoreQueue:
         assert result["title"] == "Already Here"
 
     def test_isbn10_input_normalized(self, admin_client, db):
-        with patch("app.routers.items._lookup_metadata",
-                   new=AsyncMock(return_value=(None, None, {}))):
+        with patch("app.routers.items_common._lookup_metadata",
+                   new=AsyncMock(return_value=(None, None, {}, False))):
             resp = admin_client.post("/api/store/queue", json={"isbns": ["0441013597"]})
         assert resp.json()["results"][0]["isbn"] == "9780441013593"
 

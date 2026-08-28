@@ -9,6 +9,7 @@ import re
 
 import httpx
 
+from app.services import authors as authors_svc
 from app.services import googlebooks, hardcover, openlibrary
 
 logger = logging.getLogger(__name__)
@@ -16,18 +17,6 @@ logger = logging.getLogger(__name__)
 # Media types the book-metadata sources can answer for. Games/movies get
 # descriptions from IGDB/TMDb at scan time and aren't backfilled here.
 BOOK_MEDIA_TYPES = ("book", "ebook", "audiobook", "kids_book")
-
-
-def _authors_match(wanted: str | None, found: str | None) -> bool:
-    """The item's first author must appear among the result's authors.
-    Guards against adaptations and study guides of famous titles, which
-    rank high in title searches."""
-    if not wanted:
-        return True
-    if not found:
-        return False
-    first = wanted.split(",")[0].strip().casefold()
-    return bool(first) and first in found.casefold()
 
 
 _STOPWORDS = frozenset({"the", "a", "an", "of", "and", "to", "in", "for"})
@@ -59,7 +48,7 @@ def _result_ok(authors: str | None, query_title: str, res: dict) -> bool:
     """Accept a search result: author match when we have an author,
     strict title overlap when we don't."""
     if authors:
-        return _authors_match(authors, res.get("authors"))
+        return authors_svc.matches(authors, res.get("authors"))
     return _title_close_enough(query_title, res.get("title"))
 
 
@@ -73,18 +62,10 @@ async def fetch_description(isbn: str | None, title: str | None, authors: str | 
     Hardcover sits early in the chain because Google Books' anonymous quota
     is per-IP and exhausts under bulk backfills, and Open Library work
     records are frequently description-less even when the search matches."""
-    google_hard_failure = False
-    if isbn and google_api_key:
-        try:
-            meta = await googlebooks.lookup(isbn, client, api_key=google_api_key)
-            if meta and meta.get("description"):
-                return meta["description"]
-        except (googlebooks.GoogleBooksAccessError, googlebooks.GoogleBooksQuotaError,
-                googlebooks.GoogleBooksTransportError):
-            google_hard_failure = True
-            logger.debug("Google Books ISBN lookup unavailable for %s", isbn)
-        except (httpx.HTTPError, googlebooks.GoogleBooksError):
-            logger.debug("Google Books ISBN lookup failed for %s", isbn)
+    if isbn:
+        meta = await googlebooks.lookup(isbn, client, api_key=google_api_key)
+        if meta and meta.get("description"):
+            return meta["description"]
 
     if not title:
         return None
@@ -114,15 +95,14 @@ async def fetch_description(isbn: str | None, title: str | None, authors: str | 
     except httpx.HTTPError:
         logger.debug("Open Library synopsis search failed for %r", title)
 
-    if google_hard_failure or not google_api_key:
-        return None
     try:
         results = await googlebooks.search_by_title_author(
-            search_title, first_author, client, api_key=google_api_key)
+            search_title, first_author, client, api_key=google_api_key
+        )
         for res in results:
             if _result_ok(authors, search_title, res) and res.get("description"):
                 return res["description"]
-    except (httpx.HTTPError, googlebooks.GoogleBooksError):
+    except httpx.HTTPError:
         logger.debug("Google Books synopsis search failed for %r", title)
 
     return None

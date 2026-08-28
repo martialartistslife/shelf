@@ -69,15 +69,38 @@ document.addEventListener('alpine:init', function () {
     Alpine.data('absSync', function () {
         return {
             syncing: false, result: false, absStatus: false, absTesting: false, showAbsHelp: false,
-            absUrl: '', absToken: '', absSaved: false,
+            absUrl: '', absToken: '', absSaved: false, absUrlPresent: false,
             syncCurrent: 0, syncTotal: 0, syncLastTitle: '', syncLog: [], showSyncLog: false,
             init() {
                 this.absUrl = this.$el.dataset.absUrl || '';
+                this.absUrlPresent = this.$el.dataset.absUrlPresent === '1';
                 this.absSaved = this.$el.dataset.absSaved === '1';
             },
             get syncPct() { return Math.round(this.syncCurrent / this.syncTotal * 100) + '%'; },
+            // One source for "Test has something to send". The template's
+            // :disabled and testAbs()'s early return both read this getter —
+            // when the same decision lived in two places, reverting only the
+            // JS copy left the button enabled and silently returning before
+            // fetch(), with the render test and the Alpine lint both green
+            // (G49; issue #39 diff review).
+            get absTestReady() {
+                return Boolean((this.absUrl || this.absUrlPresent) && (this.absToken || this.absSaved));
+            },
+            // Sync streams from the server's stored credentials and never reads
+            // the form (sync.py's /stream reads get_setting for both and ignores
+            // the request), so this asks whether a credential is *available*, not
+            // what is typed. absUrl is deliberately absent: it renders '' for an
+            // env-only install (G49; issue #41).
+            get absSyncReady() {
+                return Boolean(this.absUrlPresent && this.absSaved);
+            },
+            get syncLabel() {
+                if (this.absSyncReady) return 'Sync Now';
+                if (this.absUrl || this.absToken) return 'Save your settings to sync';
+                return 'Enter URL and token to sync';
+            },
             testAbs() {
-                if (!this.absUrl || (!this.absToken && !this.absSaved)) return;
+                if (!this.absTestReady) return;
                 this.absTesting = true; this.absStatus = false;
                 fetch('/api/sync/audiobookshelf/test', {
                     method: 'POST',
@@ -88,6 +111,7 @@ document.addEventListener('alpine:init', function () {
                   .catch(() => { this.absStatus = { ok: false, message: 'Connection failed' }; this.absTesting = false; });
             },
             startSync() {
+                if (!this.absSyncReady) return;
                 this.syncing = true; this.result = false; this.syncCurrent = 0; this.syncTotal = 0;
                 this.syncLastTitle = ''; this.syncLog = []; this.showSyncLog = false;
                 var self = this;
@@ -231,26 +255,6 @@ document.addEventListener('alpine:init', function () {
         };
     });
 
-    Alpine.data('googleBooksPanel', function () {
-        return {
-            apiKey: '', testing: false, status: null,
-            saved: false,
-            init() { this.saved = this.$root.dataset.googleSaved === '1'; },
-            async testGoogle() {
-                this.testing = true; this.status = null;
-                try {
-                    const response = await fetch('/api/settings/google-books/test', {
-                        method: 'POST', headers: {'Content-Type': 'application/json',
-                            'X-CSRF-Token': window.csrfToken()},
-                        body: JSON.stringify({api_key: this.apiKey})
-                    });
-                    this.status = await response.json();
-                } catch (_) { this.status = {ok: false, message: 'Connection test failed'}; }
-                this.testing = false;
-            }
-        };
-    });
-
     // settings.html — Collection Valuation card (ISBNdb)
     Alpine.data('valuationPanel', function () {
         return {
@@ -282,7 +286,7 @@ document.addEventListener('alpine:init', function () {
                     if (d.type === 'progress') {
                         self.valCurrent = d.current; self.valTotal = d.total;
                         self.valLastTitle = d.title;
-                        self.valLog.push({i: d.current, t: d.title, s: d.status});
+                        self.valLog.push({i: d.current, t: d.title, s: d.status, p: !!d.priced});
                     } else if (d.type === 'done') {
                         self.valResult = d; self.valuating = false; es.close();
                     } else if (d.type === 'error') {
@@ -290,6 +294,28 @@ document.addEventListener('alpine:init', function () {
                     }
                 };
                 es.onerror = function () { self.valResult = {message: 'Connection lost'}; self.valuating = false; es.close(); };
+            }
+        };
+    });
+
+    // settings.html — Google Books card (optional credential)
+    Alpine.data('googleBooksPanel', function () {
+        return {
+            googleBooksStatus: false, googleBooksTesting: false,
+            googleBooksKey: '', googleBooksSaved: false,
+            init() {
+                this.googleBooksSaved = this.$el.dataset.googleBooksSaved === '1';
+            },
+            testGoogleBooks() {
+                if (!this.googleBooksKey && !this.googleBooksSaved) return;
+                this.googleBooksTesting = true; this.googleBooksStatus = false;
+                fetch('/api/settings/google-books/test', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': window.csrfToken() },
+                    body: JSON.stringify({ api_key: this.googleBooksKey })
+                }).then(r => r.json())
+                  .then(d => { this.googleBooksStatus = d; this.googleBooksTesting = false; })
+                  .catch(() => { this.googleBooksStatus = { ok: false, message: 'Connection failed' }; this.googleBooksTesting = false; });
             }
         };
     });
@@ -402,6 +428,202 @@ document.addEventListener('alpine:init', function () {
         };
     });
 
+    // settings.html — Portable archive import card.
+    //
+    // Two steps: preview (POST /api/import/archive/plan, writes nothing) then
+    // confirm (POST /api/import/archive/apply). Selection state is flat
+    // booleans — the Alpine CSP build silently drops a nested/bracketed
+    // x-model — and every count or label the card shows is computed here
+    // rather than in a template expression.
+    Alpine.data('archivePanel', function () {
+        return {
+            step: 1,                    // 1 choose · 2 review plan · 3 report
+            planning: false,
+            importing: false,
+            plan: false,
+            planMode: 'skip',
+            uploadId: '',
+            errorMessage: '',
+            importResult: false,
+            deselectedLines: [],
+            selCreates: true,
+            selUpdates: true,
+            selCovers: true,
+            selReplaceCovers: false,
+            selReadingLog: true,
+            selCheckouts: true,
+            selValuation: true,
+
+            resetSelection() {
+                this.selCreates = true;
+                this.selUpdates = true;
+                this.selCovers = true;
+                this.selReplaceCovers = false;   // overwriting a cover is always opt-in
+                this.selReadingLog = true;
+                this.selCheckouts = true;
+                this.selValuation = true;
+            },
+
+            doPlan(e) {
+                var self = this;
+                this.planning = true;
+                this.errorMessage = '';
+                this.importResult = false;
+                fetch('/api/import/archive/plan', {
+                    method: 'POST',
+                    body: new FormData(e.target),
+                    headers: { 'X-CSRF-Token': window.csrfToken() }
+                })
+                    .then(function (r) { return r.json(); })
+                    .then(function (d) {
+                        self.planning = false;
+                        if (d.error) { self.errorMessage = d.error; return; }
+                        self.plan = d.plan;
+                        self.planMode = d.plan.mode;
+                        self.uploadId = d.upload_id;
+                        self.resetSelection();
+                        self.step = 2;
+                    })
+                    .catch(function () {
+                        self.planning = false;
+                        self.errorMessage = 'Preview failed';
+                    });
+            },
+
+            doApply() {
+                var self = this;
+                this.importing = true;
+                this.errorMessage = '';
+                var body = new FormData();
+                body.append('upload_id', this.uploadId);
+                body.append('mode', this.planMode);
+                body.append('include_creates', this.selCreates ? 'true' : 'false');
+                body.append('include_updates', this.selUpdates ? 'true' : 'false');
+                body.append('covers', this.selCovers ? 'true' : 'false');
+                body.append('replace_covers', this.selReplaceCovers ? 'true' : 'false');
+                body.append('reading_log', this.selReadingLog ? 'true' : 'false');
+                body.append('checkouts', this.selCheckouts ? 'true' : 'false');
+                body.append('valuation_history', this.selValuation ? 'true' : 'false');
+                fetch('/api/import/archive/apply', {
+                    method: 'POST',
+                    body: body,
+                    headers: { 'X-CSRF-Token': window.csrfToken() }
+                })
+                    .then(function (r) { return r.json(); })
+                    .then(function (d) {
+                        self.importing = false;
+                        self.importResult = d;
+                        self.deselectedLines = self.buildDeselectedLines(d);
+                        self.step = 3;
+                    })
+                    .catch(function () {
+                        self.importing = false;
+                        self.importResult = { error: 'Import failed' };
+                        self.deselectedLines = [];
+                        self.step = 3;
+                    });
+            },
+
+            startOver() {
+                // No server call: the staged upload is collected by the TTL
+                // sweep the next plan/apply request runs.
+                this.step = 1;
+                this.plan = false;
+                this.uploadId = '';
+                this.importResult = false;
+                this.deselectedLines = [];
+                this.errorMessage = '';
+                this.resetSelection();
+            },
+
+            plural(n, word) {
+                return n + ' ' + word + (n === 1 ? '' : 's');
+            },
+
+            importCount() {
+                if (!this.plan) { return 0; }
+                var n = 0;
+                if (this.selCreates) { n += this.plan.summary.create; }
+                if (this.selUpdates && this.planMode === 'update') { n += this.plan.summary.update; }
+                return n;
+            },
+
+            importLabel() {
+                return 'Import ' + this.plural(this.importCount(), 'item');
+            },
+
+            // "494 new, 168 already in your library (skipped), 3 to update"
+            verdictSentence() {
+                if (!this.plan) { return ''; }
+                var s = this.plan.summary;
+                var parts = [s.create + ' new'];
+                if (s.skip) { parts.push(s.skip + ' already in your library (skipped)'); }
+                if (s.update) { parts.push(s.update + ' to update'); }
+                return parts.join(', ');
+            },
+
+            // How many verdicts rest on the fuzzy title/author match — the
+            // path that covers most of an ISBN-less library.
+            basisNote() {
+                if (!this.plan) { return ''; }
+                var b = this.plan.summary.by_basis || {};
+                var parts = [];
+                if (b.title_authors) { parts.push(b.title_authors + ' matched by title/author'); }
+                if (b.isbn) { parts.push(b.isbn + ' by ISBN'); }
+                return parts.length ? parts.join(', ') : '';
+            },
+
+            payloadNote() {
+                if (!this.plan) { return ''; }
+                var s = this.plan.summary;
+                var wc = s.would_create || {};
+                var parts = [];
+                if (s.covers_install) { parts.push(this.plural(s.covers_install, 'cover')); }
+                if ((wc.series || []).length) { parts.push(wc.series.length + ' new series'); }
+                if ((wc.locations || []).length) { parts.push(this.plural(wc.locations.length, 'new location')); }
+                if ((wc.tags || []).length) { parts.push(this.plural(wc.tags.length, 'new tag')); }
+                if ((wc.borrowers || []).length) { parts.push(this.plural(wc.borrowers.length, 'new borrower')); }
+                if (s.reading_log) { parts.push(this.plural(s.reading_log, 'reading-log entry')); }
+                if (s.checkouts) { parts.push(this.plural(s.checkouts, 'loan')); }
+                return parts.length ? 'Plus ' + parts.join(', ') + '.' : '';
+            },
+
+            replaceCoversNote() {
+                if (!this.plan) { return ''; }
+                var n = this.plan.summary.covers_replace;
+                return n ? 'Replace ' + this.plural(n, 'existing cover') : 'Replace existing covers';
+            },
+
+            valuationNote() {
+                if (!this.plan) { return ''; }
+                var v = this.plan.summary.valuation_history || {};
+                if (!v.rows) { return ''; }
+                if (!v.mergeable) {
+                    return this.plural(v.rows, 'valuation-history row') + ' (not mergeable — this library already has valuation history)';
+                }
+                return this.plural(v.rows, 'valuation-history row');
+            },
+
+            buildDeselectedLines(report) {
+                var d = report && report.deselected;
+                if (!d) { return []; }
+                var lines = [];
+                if (d.creates) { lines.push(this.plural(d.creates, 'new item') + ' not imported (deselected)'); }
+                if (d.updates) { lines.push(this.plural(d.updates, 'item') + ' not updated (deselected)'); }
+                if (d.covers) { lines.push(this.plural(d.covers, 'cover') + ' not installed (deselected)'); }
+                if (d.reading_log) { lines.push('Reading log: ' + this.plural(d.reading_log, 'row') + ' not imported (deselected)'); }
+                if (d.checkouts) { lines.push('Loans: ' + this.plural(d.checkouts, 'row') + ' not imported (deselected)'); }
+                if (d.valuation_history) { lines.push('Valuation history: ' + this.plural(d.valuation_history, 'row') + ' not imported (deselected)'); }
+                return lines;
+            },
+
+            driftedNote() {
+                var n = this.importResult && this.importResult.drifted;
+                return n ? this.plural(n, 'item') + ' changed between the preview and the import, and were left alone.' : '';
+            }
+        };
+    });
+
     // settings.html — Sharing card (copy-link buttons)
     Alpine.data('sharePanel', function () {
         return {
@@ -487,4 +709,20 @@ document.addEventListener('alpine:init', function () {
         };
     });
 
+});
+
+// Delete confirmations for the plain <form method="post"> deletes on the
+// Settings page. Inline `onclick="return confirm(...)"` is dead under this
+// app's CSP (script-src 'self', no unsafe-inline / unsafe-hashes), so those
+// forms carry a `data-confirm` attribute and this one delegated listener
+// runs the native dialog instead. Native confirm() from an external file is
+// CSP-clean — the same pattern deleteUser() above and browse.js already use.
+//
+// Deliberately NOT an Alpine component: there is no state to register, and
+// the message is assembled server-side in Jinja so the copy stays greppable.
+document.addEventListener('submit', function (e) {
+    const form = e.target;
+    if (!form || !form.getAttribute) return;
+    const msg = form.getAttribute('data-confirm');
+    if (msg && !confirm(msg)) e.preventDefault();
 });

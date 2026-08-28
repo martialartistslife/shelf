@@ -16,8 +16,13 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
+# httpx logs every outbound request URL at INFO. TMDb v3 authentication puts
+# the API key in the query string, so redact credential values before they
+# reach the container log or the in-app log viewer.
+from app.log_handler import RedactQueryFilter, SQLiteHandler
+logging.getLogger("httpx").addFilter(RedactQueryFilter())
+
 # Add SQLite handler so logs are viewable in the web UI
-from app.log_handler import SQLiteHandler
 _db_handler = SQLiteHandler()
 _db_handler.setLevel(logging.INFO)
 _db_handler.setFormatter(logging.Formatter("%(message)s"))
@@ -31,9 +36,12 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response, RedirectResponse
 
+from app import browse_columns, browse_filters
 from app.config import COVERS_DIR, DATA_DIR, MEDIA_TYPES, get_client_ip
+from app.currency import CURRENCIES, format_money, get_currency
+from app.services.national import SEARCH_LANGS
 from app.database import init_db, get_db
-from app.routers import pages, items, locations, platforms, settings, sync, checkouts, valuation, hardcover, store, series, share, tags, intake
+from app.routers import pages, items, items_covers, items_csv, items_catalog, locations, platforms, settings, sync, checkouts, valuation, hardcover, store, series, share, tags, intake, archive
 from app.routers import auth_routes
 
 
@@ -46,7 +54,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-XSS-Protection"] = "1; mode=block"
         # No 'unsafe-inline', no CDN hosts, and no 'unsafe-eval': all JS is
         # served from /static and Alpine is the CSP build (no new Function) —
-        # see docs/plans/CSP_BUNDLING.md and docs/plans/ALPINE_CSP.md.
+        # see .devdocs/archive/completed/CSP_BUNDLING.md and .devdocs/archive/completed/ALPINE_CSP.md.
         # scripts/check_alpine_csp.py keeps template expressions parseable.
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
@@ -59,8 +67,9 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
             "form-action 'self'; "
             "frame-ancestors 'none';"
         )
-        # Camera stays first-party for barcode scanning (html5-qrcode getUserMedia);
-        # everything else is denied outright.
+        # Camera stays first-party for barcode scanning (html5-qrcode / ZXing
+        # getUserMedia) and the photo-intake webcam viewfinder; everything else
+        # is denied outright.
         response.headers["Permissions-Policy"] = (
             "camera=(self), microphone=(), geolocation=(), payment=(), usb=()"
         )
@@ -351,10 +360,14 @@ async def lifespan(app: FastAPI):
     task = asyncio.create_task(_periodic_abs_sync())
     hc_task = asyncio.create_task(_periodic_hardcover_sync())
     loan_task = asyncio.create_task(_periodic_loan_reminders())
+    from app.services import cover_queue
+    cover_task = cover_queue.start()
     yield
     task.cancel()
     hc_task.cancel()
     loan_task.cancel()
+    if cover_task is not None:
+        cover_task.cancel()
 
 
 app = FastAPI(title="Shelf", lifespan=lifespan)
@@ -391,6 +404,16 @@ def strip_html(value: str) -> str:
     return html_mod.unescape(value).strip()
 
 templates.env.filters["strip_html"] = strip_html
+templates.env.filters["money"] = format_money
+templates.env.globals["currency"] = get_currency
+templates.env.globals["currencies"] = CURRENCIES
+templates.env.globals["search_langs"] = SEARCH_LANGS
+# Browse's hx-include lists are derived, not written — see app/browse_filters.py.
+templates.env.globals["filter_includes"] = browse_filters.filter_includes
+templates.env.globals["browse_filter_config"] = browse_filters.client_config
+# Browse's list-view column set is derived, not written — see app/browse_columns.py.
+templates.env.globals["browse_columns"] = browse_columns.COLUMNS
+templates.env.globals["browse_column_config"] = browse_columns.client_config
 
 # Wrap TemplateResponse to auto-inject 'user' from request.state
 _original_template_response = templates.TemplateResponse
@@ -404,29 +427,46 @@ def _template_response_with_user(request_or_self, *args, **kwargs):
     else:
         return _original_template_response(request_or_self, *args, **kwargs)
 
-    # Find the context dict and inject user
+    # Find the context dict and inject user + the nav tabs that user can see
+    from app.nav import visible_tabs
+    user = getattr(request.state, "user", None)
     context = kwargs.get('context', None)
     if context is None:
         # Context is a positional arg (3rd after request, name)
         for i, a in enumerate(args):
             if isinstance(a, dict):
-                a.setdefault("user", getattr(request.state, "user", None))
+                a.setdefault("user", user)
+                a.setdefault("nav_tabs", visible_tabs(user))
                 break
     else:
-        context.setdefault("user", getattr(request.state, "user", None))
+        context.setdefault("user", user)
+        context.setdefault("nav_tabs", visible_tabs(user))
 
     return _original_template_response(request_or_self, *args, **kwargs)
 
 templates.TemplateResponse = _template_response_with_user
 app.state.templates = templates
 
-# Static files
-static_dir = Path(__file__).parent.parent / "static"
-app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+# Static files.
+# StaticFiles sends ETag/Last-Modified but no Cache-Control, so browsers fall
+# back to RFC 9111 heuristic freshness and can serve stale assets for weeks
+# after an upgrade (issue #21). `no-cache` forces revalidation on every use;
+# the existing validators turn that into cheap 304s. file_response() is the
+# one hook both 200 and 304 responses flow through.
+class CacheControlStaticFiles(StaticFiles):
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
 
-# Serve cached covers from data volume
+
+static_dir = Path(__file__).parent.parent / "static"
+app.mount("/static", CacheControlStaticFiles(directory=str(static_dir)), name="static")
+
+# Serve cached covers from data volume (same staleness bug: covers are
+# overwritten in place at a stable path, so they need revalidation too)
 COVERS_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/covers", StaticFiles(directory=str(COVERS_DIR)), name="covers")
+app.mount("/covers", CacheControlStaticFiles(directory=str(COVERS_DIR)), name="covers")
 
 # Health check (unauthenticated, for container orchestration)
 @app.get("/health")
@@ -443,6 +483,10 @@ async def health():
 app.include_router(auth_routes.router)
 app.include_router(pages.router)
 app.include_router(items.router)
+# items.py was split by feature area (Lever 5); all four share the /api prefix.
+app.include_router(items_covers.router)
+app.include_router(items_csv.router)
+app.include_router(items_catalog.router)
 app.include_router(locations.router)
 app.include_router(platforms.router)
 app.include_router(settings.router)
@@ -455,3 +499,4 @@ app.include_router(series.router)
 app.include_router(share.router)
 app.include_router(tags.router)
 app.include_router(intake.router)
+app.include_router(archive.router)

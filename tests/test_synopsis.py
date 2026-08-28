@@ -6,11 +6,10 @@ import httpx
 import pytest
 import respx
 
-from app.services import googlebooks, synopsis
+from app.services import synopsis
 from tests.conftest import _insert_item
 
 GB_URL = "https://www.googleapis.com/books/v1/volumes"
-GB_KEY = "test-google-key"
 OL_SEARCH_URL = "https://openlibrary.org/search.json"
 
 
@@ -22,26 +21,26 @@ def _gb_volume(title="Dune", authors=("Frank Herbert",), description="A desert p
 
 class TestFetchDescription:
     @pytest.mark.asyncio
-    async def test_hard_google_failure_suppresses_second_google_call(self):
-        with patch("app.services.synopsis.googlebooks.lookup",
-                   AsyncMock(side_effect=googlebooks.GoogleBooksQuotaError("quota"))) as lookup, \
-             patch("app.services.synopsis.googlebooks.search_by_title_author",
-                   AsyncMock()) as title_search, \
-             patch("app.services.synopsis.openlibrary.search_by_title_author",
-                   AsyncMock(return_value=[])):
-            assert await synopsis.fetch_description(
-                "9780441013593", "Dune", "Frank Herbert", AsyncMock(),
-                google_api_key=GB_KEY) is None
-        lookup.assert_awaited_once()
-        title_search.assert_not_awaited()
+    async def test_google_key_reaches_isbn_and_title_searches(self):
+        isbn_lookup = AsyncMock(return_value=None)
+        title_search = AsyncMock(return_value=[])
+        with patch("app.services.googlebooks.lookup", new=isbn_lookup), \
+             patch("app.services.openlibrary.search_by_title_author", new=AsyncMock(return_value=[])), \
+             patch("app.services.googlebooks.search_by_title_author", new=title_search):
+            await synopsis.fetch_description(
+                "9780441013593", "Dune", "Frank Herbert", object(),
+                google_api_key="google-key",
+            )
+
+        assert isbn_lookup.await_args.kwargs["api_key"] == "google-key"
+        assert title_search.await_args.kwargs["api_key"] == "google-key"
 
     @respx.mock
     @pytest.mark.asyncio
     async def test_google_books_isbn_first(self):
         respx.get(GB_URL).mock(return_value=httpx.Response(200, json=_gb_volume()))
         async with httpx.AsyncClient() as client:
-            desc = await synopsis.fetch_description(
-                "9780441013593", "Dune", "Frank Herbert", client, google_api_key=GB_KEY)
+            desc = await synopsis.fetch_description("9780441013593", "Dune", "Frank Herbert", client)
         assert desc == "A desert planet epic."
 
     @respx.mock
@@ -55,8 +54,7 @@ class TestFetchDescription:
         respx.get("https://openlibrary.org/works/OL893415W.json").mock(
             return_value=httpx.Response(200, json={"description": {"value": "From Open Library."}}))
         async with httpx.AsyncClient() as client:
-            desc = await synopsis.fetch_description(
-                "9780441013593", "Dune", "Frank Herbert", client, google_api_key=GB_KEY)
+            desc = await synopsis.fetch_description("9780441013593", "Dune", "Frank Herbert", client)
         assert desc == "From Open Library."
 
     @respx.mock
@@ -70,8 +68,7 @@ class TestFetchDescription:
             "key": "/works/OL1W", "title": "Dune Study Guide", "author_name": ["SparkNotes Editors"],
         }]}))
         async with httpx.AsyncClient() as client:
-            desc = await synopsis.fetch_description(
-                None, "Dune", "Frank Herbert", client, google_api_key=GB_KEY)
+            desc = await synopsis.fetch_description(None, "Dune", "Frank Herbert", client)
         assert desc is None
 
     @respx.mock
@@ -90,7 +87,7 @@ class TestFetchDescription:
         async with httpx.AsyncClient() as client:
             desc = await synopsis.fetch_description(
                 "9781978665101", "The Singularity Trap", "Dennis E. Taylor",
-                client, hc_token="hc-test-token", google_api_key=GB_KEY)
+                client, hc_token="hc-test-token")
         assert desc == "From Hardcover."
 
     @respx.mock
@@ -114,9 +111,7 @@ class TestFetchDescription:
         respx.get(GB_URL).mock(side_effect=httpx.ConnectError("down"))
         respx.get(OL_SEARCH_URL).mock(side_effect=httpx.ConnectError("down"))
         async with httpx.AsyncClient() as client:
-            assert await synopsis.fetch_description(
-                "9780441013593", "Dune", "Frank Herbert", client,
-                google_api_key=GB_KEY) is None
+            assert await synopsis.fetch_description("9780441013593", "Dune", "Frank Herbert", client) is None
 
 
 class TestSlugTitles:
@@ -150,8 +145,7 @@ class TestSlugTitles:
             return_value=httpx.Response(200, json={"description": "A grappling manual."}))
         async with httpx.AsyncClient() as client:
             desc = await synopsis.fetch_description(
-                None, "mark-hatmaker-no-holds-barred-fighting", None, client,
-                google_api_key=GB_KEY)
+                None, "mark-hatmaker-no-holds-barred-fighting", None, client)
         assert desc == "A grappling manual."
 
 
@@ -167,18 +161,8 @@ class TestStripHtml:
 
 
 class TestFetchSynopsisEndpoint:
-    def test_passes_effective_google_key(self, admin_client, db, monkeypatch):
-        monkeypatch.setenv("GOOGLE_BOOKS_API_KEY", GB_KEY)
-        item_id = _insert_item(db, title="Dune", isbn="9780441013593")
-        db.execute("COMMIT")
-        with patch("app.routers.items.synopsis_svc.fetch_description",
-                   AsyncMock(return_value=None)) as fetch:
-            admin_client.post(f"/api/items/{item_id}/fetch-synopsis")
-        assert fetch.await_args.kwargs["google_api_key"] == GB_KEY
-
     @respx.mock
     def test_updates_item(self, admin_client, db):
-        db.execute("INSERT INTO settings (key, value) VALUES ('google_books_api_key', ?)", (GB_KEY,))
         item_id = _insert_item(db, title="Dune", isbn="9780441013593", authors="Frank Herbert")
         db.execute("COMMIT")
         respx.get(GB_URL).mock(return_value=httpx.Response(200, json=_gb_volume()))
@@ -191,7 +175,6 @@ class TestFetchSynopsisEndpoint:
 
     @respx.mock
     def test_not_found_reports_failure(self, admin_client, db):
-        db.execute("INSERT INTO settings (key, value) VALUES ('google_books_api_key', ?)", (GB_KEY,))
         item_id = _insert_item(db, title="Obscure", isbn="9780000000018", authors="Nobody")
         db.execute("COMMIT")
         respx.get(GB_URL).mock(return_value=httpx.Response(200, json={}))
@@ -217,7 +200,6 @@ class TestBackfillStream:
 
     @respx.mock
     def test_backfills_missing_only(self, admin_client, db):
-        db.execute("INSERT INTO settings (key, value) VALUES ('google_books_api_key', ?)", (GB_KEY,))
         needs = _insert_item(db, title="Dune", isbn="9780441013593", authors="Frank Herbert")
         _insert_item(db, title="Has Desc", isbn="9780000000025", description="already set")
         _insert_item(db, title="A Game", isbn=None, media_type="game")
@@ -232,15 +214,6 @@ class TestBackfillStream:
         assert done["success"] == 1
         row = db.execute("SELECT description FROM items WHERE id = ?", (needs,)).fetchone()
         assert row["description"] == "A desert planet epic."
-
-    def test_passes_effective_google_key(self, admin_client, db, monkeypatch):
-        monkeypatch.setenv("GOOGLE_BOOKS_API_KEY", GB_KEY)
-        _insert_item(db, title="Dune", isbn="9780441013593")
-        db.execute("COMMIT")
-        with patch("app.routers.items.synopsis_svc.fetch_description",
-                   AsyncMock(return_value=None)) as fetch:
-            admin_client.get("/api/synopses/backfill/stream")
-        assert fetch.await_args.kwargs["google_api_key"] == GB_KEY
 
     def test_empty_when_nothing_missing(self, admin_client, db):
         _insert_item(db, description="already set")
