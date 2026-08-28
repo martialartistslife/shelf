@@ -1,0 +1,70 @@
+#jeffrey-duck {
+    position: absolute;
+    z-index: 5;
+    box-sizing: border-box;
+    width: 44px;
+    height: 44px;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    line-height: 1;
+    cursor: pointer;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
+}
+
+#jeffrey-duck > span {
+    display: grid;
+    width: 100%;
+    height: 100%;
+    place-items: center;
+    font-size: 26px;
+    line-height: 1;
+    user-select: none;
+}
+
+#jeffrey-duck:focus-visible {
+    outline: 2px solid #818cf8;
+    outline-offset: 3px;
+}
+
+@supports not selector(:focus-visible) {
+    #jeffrey-duck:focus {
+        outline: 2px solid #818cf8;
+        outline-offset: 3px;
+    }
+}
+
+#jeffrey-duck.jeffrey--activated {
+    animation:
+        jeffrey-hop 160ms ease-out,
+        jeffrey-fade 280ms ease-in 100ms forwards;
+}
+
+@keyframes jeffrey-hop {
+    0% { transform: translateY(0) rotate(0deg); }
+    55% { transform: translateY(-6px) rotate(-5deg); }
+    100% { transform: translateY(0) rotate(3deg); }
+}
+
+@keyframes jeffrey-fade {
+    from { opacity: 1; }
+    to { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    #jeffrey-duck.jeffrey--activated {
+        animation: none;
+        opacity: 0;
+    }
+}
+
+@media print {
+    #jeffrey-duck {
+        display: none !important;
+    }
+}
