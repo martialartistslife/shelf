@@ -1,0 +1,36 @@
+name: PR9 badge refresh
+
+on:
+  push:
+    branches:
+      - fix/legacy-barcode-mappings
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: fix/legacy-barcode-mappings
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Install dependencies and refresh badge
+        run: |
+          pip install -r requirements.txt -r requirements-dev.txt
+          make badges
+          git rm .github/workflows/pr9-badges.yml
+          git add README.md
+          git diff --cached --check
+      - name: Commit badge update
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Refresh test count badge"
+          git push origin HEAD:fix/legacy-barcode-mappings
