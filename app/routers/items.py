@@ -25,6 +25,7 @@ from app.services import openlibrary, googlebooks, hardcover, covers, national
 from app.services import detect
 from app.services import cover_queue
 from app.services import scan_outcome
+from app.services import legacy_book
 from app.services import upc as upc_svc, tmdb, igdb
 from app.services import synopsis as synopsis_svc
 from app.services import authors as authors_svc
@@ -80,7 +81,26 @@ def _find_duplicate_item(db, isbn13: str | None, upc_code: str | None, media_typ
 
 
 def _find_item_by_barcode(raw: str) -> dict | None:
-    """Find an existing item by ISBN or UPC barcode. Returns dict or None."""
+    """Find an existing item by ISBN, UPC, or supported legacy book barcode."""
+    legacy_candidates = legacy_book.isbn13_candidates(raw)
+    if legacy_candidates:
+        matches: dict[int, dict] = {}
+        with get_db() as db:
+            for candidate in legacy_candidates:
+                item = db.execute(
+                    "SELECT i.*, l.name as location_name FROM items i "
+                    "LEFT JOIN locations l ON i.location_id = l.id WHERE i.isbn = ?",
+                    (candidate,),
+                ).fetchone()
+                if item:
+                    matches[item["id"]] = dict(item)
+        # One candidate already in the collection is enough for the
+        # non-creating scan modes. If both candidates exist, refusing
+        # to guess is safer than operating on the wrong copy.
+        if len(matches) == 1:
+            return next(iter(matches.values()))
+        return None
+
     barcode_type = upc_svc.detect_barcode_type(raw)
     # to_isbn13() zero-pads a UPC-A into an ISBN-shaped string, so a UPC must
     # not be looked up against items.isbn — that is what mis-filed them (#20).
@@ -326,19 +346,83 @@ async def scan_isbn(
             return _scan_mode_quick_rate(request, templates, item, raw)
 
     # --- Add / Wishlist modes (create new items) ---
-    # Detect barcode type — route UPC barcodes to DVD/product lookup
-    barcode_type = upc_svc.detect_barcode_type(raw)
-    if barcode_type == "upc":
-        return await items_common._scan_upc(request, templates, raw, media_type, location_id, platform or None, mode=mode)
+    # Legacy mass-market/juvenile books can carry a 12-digit price-point
+    # UPC plus a five-digit title supplement. The main UPC is shared by
+    # many books, so never send it down the ordinary product path and
+    # never pick an ISBN candidate merely because it looks plausible.
+    legacy_resolution = None
+    legacy_candidates = legacy_book.isbn13_candidates(raw)
+    if legacy_candidates:
+        barcode_type = "isbn"
+        with get_db() as db:
+            legacy_hc_token = get_setting(db, "hardcover_token") or None
+            legacy_google_api_key = get_setting(db, "google_books_api_key") or None
 
-    # Normalize ISBN
-    isbn13, _ = isbn_svc.canonicalize_isbn_pair(raw)
-    if not isbn13:
-        items_common._log_scan(isbn, media_type, "error", mode=mode)
-        return templates.TemplateResponse(
-            request, "fragments/scan_result.html",
-            {"status": "error", "isbn": isbn, "message": "Invalid ISBN"},
+        logger.info(
+            "Resolving legacy UPC+5 %s through ISBN candidates %s",
+            raw,
+            ", ".join(legacy_candidates),
         )
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as legacy_client:
+            async def lookup_candidate(candidate: str):
+                return await items_common._lookup_metadata(
+                    candidate,
+                    legacy_hc_token,
+                    legacy_client,
+                    google_api_key=legacy_google_api_key,
+                )
+
+            legacy_resolution = await legacy_book.resolve(raw, lookup_candidate)
+
+        if legacy_resolution.outcome != "found":
+            if legacy_resolution.outcome == "ambiguous":
+                message = (
+                    "Older book barcode matches more than one book — "
+                    "scan the printed ISBN"
+                )
+            elif legacy_resolution.outcome == "inconclusive":
+                message = (
+                    "Couldn’t safely verify this older book barcode right now — "
+                    "try again later or scan the printed ISBN"
+                )
+            else:
+                message = (
+                    "Older book barcode recognized, but no unique book match was found — "
+                    "scan the printed ISBN"
+                )
+            items_common._log_scan(raw, "book", "error", mode=mode)
+            return templates.TemplateResponse(
+                request,
+                "fragments/scan_result.html",
+                {"status": "error", "isbn": raw, "message": message},
+            )
+
+        assert legacy_resolution.isbn13 is not None
+        assert legacy_resolution.metadata is not None
+        isbn13 = legacy_resolution.isbn13
+    else:
+        # Detect barcode type — route ordinary UPC barcodes to
+        # DVD/product lookup.
+        barcode_type = upc_svc.detect_barcode_type(raw)
+        if barcode_type == "upc":
+            return await items_common._scan_upc(
+                request,
+                templates,
+                raw,
+                media_type,
+                location_id,
+                platform or None,
+                mode=mode,
+            )
+
+        # Normalize ordinary ISBN input.
+        isbn13, _ = isbn_svc.canonicalize_isbn_pair(raw)
+        if not isbn13:
+            items_common._log_scan(isbn, media_type, "error", mode=mode)
+            return templates.TemplateResponse(
+                request, "fragments/scan_result.html",
+                {"status": "error", "isbn": isbn, "message": "Invalid ISBN"},
+            )
 
     # §1 — the barcode outranks the dropdown when it is certain. A 978/979
     # prefix is certain, so a stale "DVD" or "Video Game" in the picker is
@@ -380,9 +464,15 @@ async def scan_isbn(
     # connectivity card is rendered from the cascade outcome below; the
     # separate "timed out — try again" wording collapses into it.
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        metadata, source, hc_ids, cascade = await items_common._lookup_metadata(
-            isbn13, hc_token, client, google_api_key=google_api_key
-        )
+        if legacy_resolution is not None:
+            metadata = legacy_resolution.metadata
+            source = legacy_resolution.source
+            hc_ids = legacy_resolution.hc_ids or {}
+            cascade = legacy_resolution.cascade
+        else:
+            metadata, source, hc_ids, cascade = await items_common._lookup_metadata(
+                isbn13, hc_token, client, google_api_key=google_api_key
+            )
 
         if not metadata:
             # G47 applied to the book path: a cascade that could not reach
