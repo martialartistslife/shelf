@@ -233,6 +233,22 @@ function scanPage() {
                 tmp.innerHTML = html;
                 var outcome = scanCardOutcome(tmp.querySelector('.scan-result'));
 
+                // An ambiguity requires interaction with the real result card
+                // below the camera. Stop the camera and reveal that card instead
+                // of trapping the user behind the full camera result overlay.
+                if (outcome && outcome.status === 'legacy_ambiguous') {
+                    if (this.scanner) {
+                        try { await this.scanner.stop(); } catch (e) {}
+                        this.scanner = false;
+                    }
+                    this.cameraActive = false;
+                    this.scanPaused = false;
+                    this.scanLoading = false;
+                    this.scanResult = false;
+                    showToast('Choose the matching book below', 'warning');
+                    return;
+                }
+
                 this.scanResult = {
                     ok: outcome.ok,
                     warn: outcome.warn,

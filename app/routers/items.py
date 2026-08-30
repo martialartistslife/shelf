@@ -132,6 +132,71 @@ async def _verify_legacy_book_barcode(raw: str) -> legacy_book.LegacyBookResolut
         return await legacy_book.resolve(raw, lookup_candidate)
 
 
+def _get_confirmed_legacy_mapping(raw: str) -> str | None:
+    """Return a learned ISBN only when it still belongs to this barcode."""
+    key = legacy_book.mapping_key(raw)
+    if key is None:
+        return None
+    candidates = legacy_book.isbn13_candidates(raw)
+    with get_db() as db:
+        row = db.execute(
+            "SELECT isbn13 FROM legacy_book_mappings WHERE barcode = ?", (key,)
+        ).fetchone()
+    if not row:
+        return None
+
+    isbn13 = row["isbn13"]
+    if not isbn_svc.validate_isbn13(isbn13) or isbn13 not in candidates:
+        # A learned mapping is identity evidence only for the exact candidate
+        # set that produced it. Corruption or a future parser change must fall
+        # back to fresh verification rather than silently widening that trust.
+        logger.error(
+            "Ignoring invalid legacy barcode mapping %s -> %s; candidates=%s",
+            key,
+            isbn13,
+            ", ".join(candidates),
+        )
+        return None
+    return isbn13
+
+
+def _save_confirmed_legacy_mapping(raw: str, isbn13: str) -> None:
+    """Remember one explicitly selected, positively verified ISBN candidate."""
+    key = legacy_book.mapping_key(raw)
+    candidates = legacy_book.isbn13_candidates(raw)
+    if (
+        key is None
+        or not isbn_svc.validate_isbn13(isbn13)
+        or isbn13 not in candidates
+    ):
+        raise ValueError("Legacy barcode confirmation is not a valid candidate")
+
+    with get_db() as db:
+        db.execute(
+            """INSERT INTO legacy_book_mappings (barcode, isbn13)
+               VALUES (?, ?)
+               ON CONFLICT(barcode) DO UPDATE SET
+                   isbn13 = excluded.isbn13,
+                   confirmed_at = datetime('now')""",
+            (key, isbn13),
+        )
+
+
+def _legacy_choice_context(
+    resolution: legacy_book.LegacyBookResolution,
+) -> list[dict[str, str | None]]:
+    """Presentation-safe choices from verified matches only."""
+    return [
+        {
+            "isbn13": match.isbn13,
+            "isbn10": isbn_svc.isbn13_to_isbn10(match.isbn13),
+            "title": str(match.metadata.get("title") or match.isbn13),
+            "authors": match.metadata.get("authors"),
+        }
+        for match in resolution.matches
+    ]
+
+
 def _legacy_resolution_message(resolution: legacy_book.LegacyBookResolution) -> str:
     if resolution.outcome == "ambiguous":
         return "Older book barcode matches more than one book — scan the printed ISBN"
@@ -335,32 +400,129 @@ async def scan_isbn(
     request: Request, isbn: str = Form(...), media_type: str = Form("book"),
     location_id: int | None = Form(None), platform: str = Form(""),
     mode: str = Form("add"), borrower_id: int | None = Form(None),
+    legacy_confirm_isbn13: str = Form(""),
     _=Depends(require_role("editor")),
 ):
     """Scan a barcode: mode-aware dispatch for add, lend, return, move, inventory, lookup, quick_rate."""
     templates = request.app.state.templates
     raw = isbn.strip()
 
-    legacy_resolution = None
-    if legacy_book.isbn13_candidates(raw):
-        legacy_resolution = await _verify_legacy_book_barcode(raw)
-        if legacy_resolution.outcome != "found":
-            items_common._log_scan(raw, "book", "error", mode=mode)
-            return templates.TemplateResponse(
-                request,
-                "fragments/scan_result.html",
-                {
-                    "status": "error",
-                    "isbn": raw,
-                    "message": _legacy_resolution_message(legacy_resolution),
-                },
+    legacy_candidates = legacy_book.isbn13_candidates(raw)
+    legacy_isbn13 = None
+    legacy_metadata = None
+    legacy_source = "manual"
+    legacy_hc_ids = {}
+    legacy_cascade = None
+
+    if legacy_candidates:
+        # A confirmed mapping is stronger than another round of provider
+        # guesses: it records what the user verified on the physical book.
+        legacy_isbn13 = _get_confirmed_legacy_mapping(raw)
+        if legacy_isbn13:
+            logger.info(
+                "Using confirmed legacy UPC+5 mapping %s -> %s",
+                legacy_book.mapping_key(raw),
+                legacy_isbn13,
             )
+        else:
+            legacy_resolution = await _verify_legacy_book_barcode(raw)
+            confirmed = isbn_svc.normalize_isbn(legacy_confirm_isbn13)
+            selected = None
+            if confirmed and isbn_svc.validate_isbn13(confirmed):
+                selected = next(
+                    (
+                        match
+                        for match in legacy_resolution.matches
+                        if match.isbn13 == confirmed
+                    ),
+                    None,
+                )
+            confirmation_accepted = (
+                bool(legacy_confirm_isbn13)
+                and legacy_resolution.outcome in {"found", "ambiguous"}
+                and selected is not None
+            )
+
+            if legacy_resolution.outcome == "ambiguous" and not confirmation_accepted:
+                if legacy_confirm_isbn13:
+                    logger.warning(
+                        "Rejected unverified legacy UPC+5 confirmation %s -> %s",
+                        raw,
+                        legacy_confirm_isbn13,
+                    )
+                # Do not log this as a failed scan. The operation is paused
+                # for a deliberate identity choice and will be logged once
+                # that choice completes the original mode.
+                return templates.TemplateResponse(
+                    request,
+                    "fragments/scan_result.html",
+                    {
+                        "status": "legacy_ambiguous",
+                        "isbn": raw,
+                        "message": _legacy_resolution_message(legacy_resolution),
+                        "legacy_candidates": _legacy_choice_context(legacy_resolution),
+                        "media_type": media_type,
+                        "location_id": location_id,
+                        "platform": platform,
+                        "mode": mode,
+                        "borrower_id": borrower_id,
+                    },
+                )
+
+            if legacy_confirm_isbn13 and not confirmation_accepted:
+                logger.warning(
+                    "Rejected stale or unverifiable legacy UPC+5 confirmation %s -> %s",
+                    raw,
+                    legacy_confirm_isbn13,
+                )
+                items_common._log_scan(raw, "book", "error", mode=mode)
+                return templates.TemplateResponse(
+                    request,
+                    "fragments/scan_result.html",
+                    {
+                        "status": "error",
+                        "isbn": raw,
+                        "message": (
+                            "Couldn’t safely verify the selected book right now — "
+                            "scan the printed ISBN or try again"
+                        ),
+                    },
+                )
+
+            if confirmation_accepted:
+                assert selected is not None
+                _save_confirmed_legacy_mapping(raw, selected.isbn13)
+                legacy_isbn13 = selected.isbn13
+                legacy_metadata = selected.metadata
+                legacy_source = selected.source
+                legacy_hc_ids = selected.hc_ids
+                legacy_cascade = selected.cascade
+                logger.info(
+                    "Learned legacy UPC+5 mapping %s -> %s",
+                    legacy_book.mapping_key(raw),
+                    legacy_isbn13,
+                )
+            elif legacy_resolution.outcome == "found":
+                legacy_isbn13 = legacy_resolution.isbn13
+                legacy_metadata = legacy_resolution.metadata
+                legacy_source = legacy_resolution.source
+                legacy_hc_ids = legacy_resolution.hc_ids or {}
+                legacy_cascade = legacy_resolution.cascade
+            else:
+                items_common._log_scan(raw, "book", "error", mode=mode)
+                return templates.TemplateResponse(
+                    request,
+                    "fragments/scan_result.html",
+                    {
+                        "status": "error",
+                        "isbn": raw,
+                        "message": _legacy_resolution_message(legacy_resolution),
+                    },
+                )
 
     # --- Modes that operate on existing items ---
     if mode in _EXISTING_ITEM_MODES:
-        lookup_barcode = (
-            legacy_resolution.isbn13 if legacy_resolution is not None else raw
-        )
+        lookup_barcode = legacy_isbn13 if legacy_candidates else raw
         assert lookup_barcode is not None
         item = _find_item_by_barcode(lookup_barcode)
         # inventory mode handles not-found specially
@@ -388,11 +550,10 @@ async def scan_isbn(
     # UPC plus a five-digit title supplement. The main UPC is shared by
     # many books, so never send it down the ordinary product path and
     # never pick an ISBN candidate merely because it looks plausible.
-    if legacy_resolution is not None:
+    if legacy_candidates:
         barcode_type = "isbn"
-        assert legacy_resolution.isbn13 is not None
-        assert legacy_resolution.metadata is not None
-        isbn13 = legacy_resolution.isbn13
+        assert legacy_isbn13 is not None
+        isbn13 = legacy_isbn13
     else:
         # Detect barcode type — route ordinary UPC barcodes to
         # DVD/product lookup.
@@ -457,12 +618,16 @@ async def scan_isbn(
     # connectivity card is rendered from the cascade outcome below; the
     # separate "timed out — try again" wording collapses into it.
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        if legacy_resolution is not None:
-            metadata = legacy_resolution.metadata
-            source = legacy_resolution.source
-            hc_ids = legacy_resolution.hc_ids or {}
-            cascade = legacy_resolution.cascade
+        if legacy_metadata is not None:
+            metadata = legacy_metadata
+            source = legacy_source
+            hc_ids = legacy_hc_ids
+            cascade = legacy_cascade
         else:
+            # A learned legacy mapping already settled identity. Add/wishlist
+            # still needs ordinary metadata for that one ISBN, but it must not
+            # re-open the discarded candidates or turn a remembered choice
+            # back into an ambiguity.
             metadata, source, hc_ids, cascade = await items_common._lookup_metadata(
                 isbn13, hc_token, client, google_api_key=google_api_key
             )
@@ -1309,6 +1474,4 @@ async def test_igdb_key(request: Request, _=Depends(require_role("admin"))):
         return {"ok": False, "message": "Both Client ID and Client Secret are required"}
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         return await igdb.test_credentials(client_id, client_secret, client)
-
-
 
