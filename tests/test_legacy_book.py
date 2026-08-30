@@ -1,12 +1,22 @@
 """Regression coverage for legacy price-point UPC-A + 5 book barcodes."""
 
 from app.services import legacy_book
+from app.services import upc as upc_svc
 
 
 # Real Scholastic copy supplied from the collection:
 # UPC 0 78073 00350 1 + title supplement 43506
 # printed ISBN 0-590-43506-X.
 KRISTY_UPC5 = "07807300350143506"
+
+
+def test_upca_validator_uses_standard_odd_position_weighting():
+    # Both are published UPC-A examples with valid check digits. This pins the
+    # weighting itself rather than only testing it indirectly through the
+    # legacy parser.
+    assert upc_svc.validate_upc("078073003501")
+    assert upc_svc.validate_upc("036000291452")
+    assert not upc_svc.validate_upc("078073003502")
 
 
 def test_real_scholastic_upc5_generates_expected_isbn_candidate():
@@ -34,5 +44,5 @@ def test_invalid_upc_check_digit_is_not_treated_as_legacy_book():
 
 def test_unknown_publisher_prefix_is_not_guessed():
     # Valid UPC-A followed by a five-digit supplement, but no verified
-    # publisher mapping.  Refusing to guess is part of the contract.
+    # publisher mapping. Refusing to guess is part of the contract.
     assert legacy_book.isbn13_candidates("03600029145243506") == ()
