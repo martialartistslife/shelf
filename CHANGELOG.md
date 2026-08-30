@@ -6,6 +6,123 @@ All notable changes to Shelf are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-08-29
+
+When a barcode scan came back with nothing, Shelf said "Not found" — and meant
+several different things by it. Sometimes the book really was unknown to every
+source. Sometimes an API key had been rejected. Sometimes a provider was
+rate-limiting the request, or the network was down. All four looked identical
+on screen, so the one case you could actually fix — a bad key — was the one you
+had no way to notice.
+
+The cause was structural: each metadata source returned a bare value and
+reported *why* somewhere else, so whichever part of Shelf asked the question
+had to reassemble the answer by hand, and each one did it slightly differently.
+Every source now returns what happened together with what it found, and the
+scan card reads that single answer. Book scans get the honest reasons that UPC
+scans already had, and the two paths can no longer drift apart.
+
+### Added
+
+- **A book scan says when a key was rejected.** Scan an ISBN with an invalid
+  Hardcover token or Google Books key and the card now reads *"Hardcover
+  rejected the configured key — this may not be a genuine miss. Check it in
+  Settings → Integrations, or add it below."*, naming the source that actually
+  refused. Previously this was indistinguishable from a book no source had
+  heard of. An invalid Google Books key is answered by Google with HTTP 400 —
+  the same status as a malformed query — which is exactly why it used to be
+  filed as "no such book".
+
+### Changed
+
+- **A failed network connection during a book lookup now says so.** Only Open
+  Library could previously surface a connection failure; Hardcover, Google
+  Books and the DNB catalog each turned a dead socket into "not found". All
+  four now reach the *"Network error during lookup — check connectivity"*
+  card, and the scan is recorded in the log as an error rather than a miss.
+  If your Shelf has been reporting books as unknown while offline, this is why.
+- **A rate-limited game scan says so.** Exhausting the Twitch/IGDB request
+  budget at the point where Shelf renews its access token used to render as
+  "no IGDB match for this barcode". It now shows the same rate-limit notice
+  every other source uses. One IGDB case is deliberately unchanged: a
+  credential rejected by the game *search* request, rather than by the token
+  request, still reads as "no match". Closing that is
+  [#49](https://github.com/dgahagan/shelf/issues/49) and needs its own pass
+  over the title-search result pages, which this release does not touch.
+- **"Not found" no longer says it twice.** A card whose message is already
+  "Not found — add manually below" used to add "no `<source>` match for this
+  barcode" underneath it. The notice line is now reserved for the cases that
+  tell you something new — a missing key, a rejected key, a spent quota.
+- **A scan the barcode does not resolve still adds nothing.** The reasons above
+  change what the card *says*, never what it files: a rejected key or a spent
+  quota is still a miss, and Shelf will not invent an item from one.
+
+### Fixed
+
+- **Hardcover's ISBN-10 fallback now actually runs.** When a 13-digit lookup
+  found nothing, Shelf retried against Hardcover's ISBN-10 field but sent the
+  unchanged 13-digit value, so the retry could never match. It had never worked;
+  a broken retry and a genuine miss returned the same empty answer, which is
+  what kept it hidden. Contributed by
+  [@martialartistslife](https://github.com/martialartistslife) in
+  [#53](https://github.com/dgahagan/shelf/pull/53).
+- **An unreadable reply from a metadata source no longer fails the scan.** A
+  200 response whose body was not the JSON or XML expected — a captive portal
+  or a proxy error page, typically — could raise out of the Open Library and
+  DNB clients. Both now treat it as a miss and fall through to the next source.
+
+## [0.23.0] - 2026-08-28
+
+Google Books is one of the sources Shelf falls back to when a scan needs more
+than Open Library can give it, and until now Shelf always called it
+anonymously. Anonymous Google Books requests are metered per source IP
+address, and that budget is shared with every other caller behind the same
+address — your ISP's NAT pool, a VPN exit, a cloud host. So those lookups can
+come back rate-limited on a completely idle Shelf, with nothing you could do
+about it. A probe from the development machine while testing this release hit
+exactly that: HTTP 429 with no key, on a query a credentialed request answered
+immediately. You can now give Shelf a Google Books API key of your own.
+
+Contributed by [@martialartistslife](https://github.com/martialartistslife) in
+[#52](https://github.com/dgahagan/shelf/pull/52).
+
+### Added
+
+- **Google Books accepts an optional API key.** Settings → Integrations has a
+  Google Books card: paste a key, press **Test Key** to confirm Google accepts
+  it before you save, and every Google Books request Shelf makes — ISBN
+  lookups, synopsis lookups and book cover search — is then made with your own
+  quota. The key can also be supplied as `GOOGLE_BOOKS_API_KEY` in the
+  environment, which overrides a stored one like every other credential.
+- **The card explains where the key comes from.** A **How to get a key?**
+  panel walks through it, because the key is issued by Google Cloud rather
+  than by a Google Books account and the path is not obvious. It also names
+  the one setting that will silently break it: an HTTP referrer restriction
+  rejects every request, since Shelf calls the API from the server and not
+  from your browser.
+- **A Google Books section in the integrations guide**, covering the same
+  ground at length plus the part worth knowing before you bother — Google
+  Books is the *last* book source tried on an ISBN scan, so a key changes
+  nothing visible while Open Library is answering, and earns its keep on thin
+  scans and on bulk work like the synopsis backfill or a large Photo Intake.
+
+### Changed
+
+- **Nothing stops working without a key, and that is deliberate.** Keyless
+  Google Books remains fully enabled; the key is optional in a way Hardcover,
+  IGDB, TMDb and ISBNdb are not. Leave the card empty and Shelf behaves
+  exactly as it did before.
+- **The key is write-only and never reaches a URL.** It is encrypted at rest
+  with the same key-outside-the-database scheme as every other credential, the
+  field renders blank once saved (leave it blank to keep the stored value),
+  and it is sent only in the `X-Goog-Api-Key` request header — so it cannot
+  end up in the outbound request URLs Shelf logs, and needs no redaction to
+  stay out of them.
+- **A rejected Google Books key says so.** Google answers an invalid key with
+  HTTP 400 rather than 401 or 403, so **Test Key** used to report a bare
+  `Google Books returned HTTP 400` for the one failure the button exists to
+  diagnose. It now reads **Google Books rejected the API key**.
+
 ## [0.22.3] - 2026-08-28
 
 Scan a barcode that no metadata source recognises and Shelf raised a pop-up
@@ -1959,6 +2076,8 @@ First public release.
   protection, encrypted credential storage, optional passphrase-encrypted
   backups, HTTPS out of the box, non-root container
 
+[0.24.0]: https://github.com/dgahagan/shelf/releases/tag/v0.24.0
+[0.23.0]: https://github.com/dgahagan/shelf/releases/tag/v0.23.0
 [0.22.3]: https://github.com/dgahagan/shelf/releases/tag/v0.22.3
 [0.22.2]: https://github.com/dgahagan/shelf/releases/tag/v0.22.2
 [0.22.1]: https://github.com/dgahagan/shelf/releases/tag/v0.22.1

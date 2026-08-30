@@ -51,20 +51,21 @@ async def search_games(
         )
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        try:
-            results = await igdb.search_games(
-                q.strip(), igdb_id, igdb_secret, client,
-                platform=platform or None, limit=10,
-            )
-        except igdb.IgdbAuthError:
-            # `search_games` now propagates a rejected credential, and this
-            # route has no other handler — without this it would be a 500.
-            # Same shape as the missing-credential block above it.
-            return HTMLResponse(
-                '<p class="text-sm text-shelf-error">IGDB rejected the configured '
-                'credentials. Check them in <a href="/settings" '
-                'class="text-shelf-accent2 underline">Settings</a>.</p>'
-            )
+        result = await igdb.search_games(
+            q.strip(), igdb_id, igdb_secret, client,
+            platform=platform or None, limit=10,
+        )
+    if result.outcome == "rejected":
+        # `search_games` reports a rejected credential as an outcome, and this
+        # route has nothing else to say about it — same shape as the
+        # missing-credential block above. A quota miss still renders the empty
+        # result list; roadmap cluster b owns telling those two apart here.
+        return HTMLResponse(
+            '<p class="text-sm text-shelf-error">IGDB rejected the configured '
+            'credentials. Check them in <a href="/settings" '
+            'class="text-shelf-accent2 underline">Settings</a>.</p>'
+        )
+    results = result.payload or []
 
     return templates.TemplateResponse(
         request, "fragments/game_search_results.html",
@@ -195,11 +196,7 @@ async def search_books(
         search_lang = get_setting(db, "metadata_search_lang") or "en"
 
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        try:
-            results = await openlibrary.search_books(q.strip(), client, limit=10, lang=search_lang)
-        except Exception:
-            logger.warning("Open Library title search failed for %r", q.strip(), exc_info=True)
-            results = []
+        results = await openlibrary.search_books(q.strip(), client, limit=10, lang=search_lang)
 
     return templates.TemplateResponse(
         request, "fragments/book_search_results.html",
@@ -224,7 +221,7 @@ async def add_book_from_search(
             {"status": "error", "isbn": isbn.strip(),
              "message": "Unrecognised media type — pick one and try again"},
         )
-    isbn13 = isbn_svc.to_isbn13(isbn.strip())
+    isbn13, _ = isbn_svc.canonicalize_isbn_pair(isbn.strip())
     if not isbn13:
         return templates.TemplateResponse(
             request, "fragments/scan_result.html",

@@ -1,9 +1,8 @@
 import logging
-from collections.abc import Callable
 
 import httpx
 
-from app.services import outbound
+from app.services import outbound, provider_result
 
 logger = logging.getLogger(__name__)
 
@@ -18,92 +17,101 @@ async def _rate_limit():
     await outbound.acquire("openlibrary.org")
 
 
-async def lookup(
-    isbn: str, client: httpx.AsyncClient,
-    *, on_rate_limit: Callable[[], None] | None = None,
-) -> dict | None:
-    """Look up a book by ISBN via Open Library. Returns metadata dict or None.
+async def lookup(isbn: str, client: httpx.AsyncClient) -> provider_result.ProviderResult:
+    """Look up a book by ISBN via Open Library.
 
-    `on_rate_limit`, when given, is called once if the provider answered 429.
-    Defaulting to `None` keeps every existing caller byte-identical. The
-    edition response is useful on its own, so optional work and author
-    enrichment is isolated below.
+    Never raises: the request and the response parse are each wrapped in
+    their own catch-all handler, matching `googlebooks.lookup`'s contract —
+    this sits in the ISBN cascade (`items_common._lookup_metadata`), which
+    stopped wrapping its legs in `except Exception` when the clients started
+    returning outcomes, so nothing above here would catch one.
+
+    Returns a `ProviderResult`: `found("openlibrary", metadata)` on a real
+    hit; `no_match` for a 200 with no usable title, an unreadable body, or any
+    other non-200, non-429 status; `rate_limited` for a 429; `transport_failed`
+    for a dead socket or timeout on the *edition* request. A failure on the
+    follow-up author/description requests leaves those fields unset and still
+    returns the hit.
     """
     await _rate_limit()
-    resp = await client.get(
-        f"https://openlibrary.org/isbn/{isbn}.json",
-        headers={"User-Agent": USER_AGENT},
-        follow_redirects=True,
-    )
-    if on_rate_limit is not None and outbound.is_rate_limited(resp):
-        on_rate_limit()
-    if resp.status_code != 200:
-        logger.debug("Open Library lookup failed for ISBN %s: HTTP %d", isbn, resp.status_code)
-        return None
-
-    data = resp.json()
-    title = data.get("title")
-    if not title:
-        return None
-
-    result = {
-        "title": title,
-        "subtitle": data.get("subtitle"),
-        "publisher": data.get("publishers", [None])[0],
-        "page_count": data.get("number_of_pages"),
-        "isbn10": data.get("isbn_10", [None])[0] if data.get("isbn_10") else None,
-    }
-
-    # Extract publish year
-    pub_date = data.get("publish_date", "")
-    import re
-    year_match = re.search(r"(\d{4})", pub_date)
-    if year_match:
-        result["publish_year"] = int(year_match.group(1))
-
-    # Work data serves both author and description enrichment. Fetch it once;
-    # an unavailable work must not discard the usable edition metadata.
-    work = None
-    works = data.get("works", [])
-    if isinstance(works, list) and works and isinstance(works[0], dict) and works[0].get("key"):
-        try:
-            work = await _fetch_work(works[0]["key"], client)
-        except Exception:
-            logger.debug("Open Library work enrichment failed for ISBN %s", isbn, exc_info=True)
-
     try:
-        author = await _resolve_author(data, client, work=work)
+        resp = await client.get(
+            f"https://openlibrary.org/isbn/{isbn}.json",
+            headers={"User-Agent": USER_AGENT},
+            follow_redirects=True,
+        )
+    except (httpx.TimeoutException, httpx.NetworkError):
+        logger.debug("Open Library lookup failed for ISBN %s: transport error", isbn, exc_info=True)
+        return provider_result.transport_failed("openlibrary")
+
+    classified = provider_result.classify_response("openlibrary", resp)
+    if classified is not None:
+        logger.debug("Open Library lookup failed for ISBN %s: HTTP %d", isbn, resp.status_code)
+        return classified
+
+    # The response parse is wrapped in its own catch-all, as
+    # `googlebooks.lookup` does: this sits in the ISBN cascade
+    # (`items_common._lookup_metadata`), which no longer wraps its legs, so an
+    # unexpected body shape here would otherwise 500 the scan instead of
+    # falling through to the next source.
+    try:
+        data = resp.json()
+        title = data.get("title")
+        if not title:
+            return provider_result.no_match("openlibrary", status=resp.status_code)
+
+        result = {
+            "title": title,
+            "subtitle": data.get("subtitle"),
+            "publisher": data.get("publishers", [None])[0],
+            "page_count": data.get("number_of_pages"),
+            "isbn10": data.get("isbn_10", [None])[0] if data.get("isbn_10") else None,
+        }
+
+        # Extract publish year
+        pub_date = data.get("publish_date", "")
+        import re
+        year_match = re.search(r"(\d{4})", pub_date)
+        if year_match:
+            result["publish_year"] = int(year_match.group(1))
+
+        # Cover ID for URL construction
+        covers = data.get("covers", [])
+        if covers:
+            result["cover_id"] = covers[0]
+
+        # Edition language, e.g. [{"key": "/languages/ger"}] -> "de"
+        languages = data.get("languages") or []
+        if languages and isinstance(languages[0], dict):
+            from app.services.national import to_iso639_1
+
+            lang = to_iso639_1(languages[0].get("key"))
+            if lang:
+                result["language"] = lang
+    except Exception:
+        logger.debug("Open Library lookup: malformed response for ISBN %s", isbn, exc_info=True)
+        return provider_result.no_match("openlibrary", status=resp.status_code)
+
+    # Author and description are a *second and third* request each. They stay
+    # outside the parse guard on purpose: a dead socket on the works/author
+    # chain must not turn an edition we already hold into "no such book"
+    # (G47). The edition is already a hit — a failed enrichment costs fields,
+    # not the result.
+    try:
+        author = await _resolve_author(data, client)
         if author:
             result["authors"] = author
-    except Exception:
-        logger.debug("Open Library author enrichment failed for ISBN %s", isbn, exc_info=True)
 
-    if isinstance(work, dict):
-        desc = work.get("description")
-        if isinstance(desc, dict):
-            desc = desc.get("value")
+        desc = await _resolve_description(data, client)
         if desc:
             result["description"] = desc
+    except Exception:
+        logger.debug("Open Library enrichment failed for ISBN %s", isbn, exc_info=True)
 
-    # Cover ID for URL construction
-    covers = data.get("covers", [])
-    if covers:
-        result["cover_id"] = covers[0]
-
-    # Edition language, e.g. [{"key": "/languages/ger"}] -> "de"
-    languages = data.get("languages") or []
-    if languages and isinstance(languages[0], dict):
-        from app.services.national import to_iso639_1
-
-        lang = to_iso639_1(languages[0].get("key"))
-        if lang:
-            result["language"] = lang
-
-    return result
+    return provider_result.found("openlibrary", result, status=resp.status_code)
 
 
-async def _resolve_author(edition_data: dict, client: httpx.AsyncClient,
-                          work: dict | None = None) -> str | None:
+async def _resolve_author(edition_data: dict, client: httpx.AsyncClient) -> str | None:
     works = edition_data.get("works", [])
     if not works:
         # Some editions have authors directly
@@ -114,8 +122,16 @@ async def _resolve_author(edition_data: dict, client: httpx.AsyncClient,
                 return await _fetch_author_name(akey, client)
         return None
 
-    if work is None:
+    await _rate_limit()
+    work_resp = await client.get(
+        f"https://openlibrary.org{works[0]['key']}.json",
+        headers={"User-Agent": USER_AGENT},
+        follow_redirects=True,
+    )
+    if work_resp.status_code != 200:
         return None
+
+    work = work_resp.json()
     authors = work.get("authors", [])
     if not authors:
         return None
@@ -129,20 +145,6 @@ async def _resolve_author(edition_data: dict, client: httpx.AsyncClient,
         return None
 
     return await _fetch_author_name(akey, client)
-
-
-async def _fetch_work(work_key: str, client: httpx.AsyncClient) -> dict | None:
-    """Fetch one Open Library work record for optional enrichment."""
-    await _rate_limit()
-    resp = await client.get(
-        f"https://openlibrary.org{work_key}.json",
-        headers={"User-Agent": USER_AGENT},
-        follow_redirects=True,
-    )
-    if resp.status_code != 200:
-        return None
-    work = resp.json()
-    return work if isinstance(work, dict) else None
 
 
 async def _fetch_author_name(author_key: str, client: httpx.AsyncClient) -> str | None:
@@ -207,28 +209,20 @@ async def search_by_title_author(title: str, author: str | None, client: httpx.A
 
 
 async def _search(params: dict, client: httpx.AsyncClient, limit: int, lang: str = "en") -> list[dict]:
-    try:
-        await _rate_limit()
-        resp = await client.get(
-            "https://openlibrary.org/search.json",
-            # lang makes the `editions` subquery surface the best edition per
-            # work in the caller's configured search language, so translations
-            # in other languages don't win the ISBN pick
-            params={**params, "limit": str(limit), "fields": _SEARCH_FIELDS, "lang": lang},
-            headers={"User-Agent": USER_AGENT},
-        )
-    except Exception:
-        logger.warning("Open Library search request failed for %r", params, exc_info=True)
-        return []
+    await _rate_limit()
+    resp = await client.get(
+        "https://openlibrary.org/search.json",
+        # lang makes the `editions` subquery surface the best edition per
+        # work in the caller's configured search language, so translations
+        # in other languages don't win the ISBN pick
+        params={**params, "limit": str(limit), "fields": _SEARCH_FIELDS, "lang": lang},
+        headers={"User-Agent": USER_AGENT},
+    )
     if resp.status_code != 200:
         logger.debug("Open Library search failed for %r: HTTP %d", params, resp.status_code)
         return []
 
-    try:
-        docs = resp.json().get("docs", [])
-    except (AttributeError, TypeError, ValueError):
-        logger.warning("Open Library search returned malformed JSON for %r", params)
-        return []
+    docs = resp.json().get("docs", [])
     results = []
     for doc in docs:
         title = doc.get("title")

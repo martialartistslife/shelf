@@ -634,7 +634,7 @@ class TestAnalyzeEndpoint:
             },
             {
                 "title": "Die Verwandlung", "author_name": ["Franz Kafka"],
-                "isbn": ["9783150000010"], "language": ["ger"],
+                "isbn": ["9783150000014"], "language": ["ger"],
             },
         ]}))
         resp = admin_client.post("/api/intake/confirm", json={
@@ -642,7 +642,7 @@ class TestAnalyzeEndpoint:
         })
         assert resp.json()["ok"] is True
         row = db.execute("SELECT isbn, language FROM items WHERE title = 'Die Verwandlung'").fetchone()
-        assert row["isbn"] == "9783150000010"
+        assert row["isbn"] == "9783150000014"
         assert row["language"] == "de"
 
     def test_viewer_forbidden(self, viewer_client):

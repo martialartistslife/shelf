@@ -28,7 +28,7 @@ from pathlib import Path
 
 from app import config
 from app.services.covers import MAX_COVER_SIZE, MIN_COVER_SIZE, _looks_like_image
-from app.services.item_write import insert_item
+from app.services.item_write import canonicalize_isbn_fields, insert_item
 
 logger = logging.getLogger(__name__)
 
@@ -586,6 +586,7 @@ def _apply_item_update(db, item_id: int, item: dict, loc_id: int | None) -> None
             updates[col] = val
     if loc_id is not None:
         updates["location_id"] = loc_id
+    updates = canonicalize_isbn_fields(updates)
     if not updates:
         db.execute("UPDATE items SET updated_at = datetime('now') WHERE id = ?", (item_id,))
         return

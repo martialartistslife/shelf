@@ -20,10 +20,11 @@ from app.routers.series import MAX_SERIES_NAME
 from app.routers import items_common
 from app.routers.items_common import SORT_OPTIONS  # re-exported for pages.py
 from app.services import isbn as isbn_svc
-from app.services.item_write import insert_item
+from app.services.item_write import canonicalize_isbn_fields, insert_item
 from app.services import openlibrary, googlebooks, hardcover, covers, national
 from app.services import detect
 from app.services import cover_queue
+from app.services import scan_outcome
 from app.services import upc as upc_svc, tmdb, igdb
 from app.services import synopsis as synopsis_svc
 from app.services import authors as authors_svc
@@ -331,7 +332,7 @@ async def scan_isbn(
         return await items_common._scan_upc(request, templates, raw, media_type, location_id, platform or None, mode=mode)
 
     # Normalize ISBN
-    isbn13 = isbn_svc.to_isbn13(raw)
+    isbn13, _ = isbn_svc.canonicalize_isbn_pair(raw)
     if not isbn13:
         items_common._log_scan(isbn, media_type, "error", mode=mode)
         return templates.TemplateResponse(
@@ -372,62 +373,69 @@ async def scan_isbn(
         google_api_key = get_setting(db, "google_books_api_key") or None
 
     logger.info("Scanning ISBN %s (type=%s, mode=%s)", isbn13, media_type, mode)
-    try:
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-            metadata, source, hc_ids, lookup_rate_limited = await items_common._lookup_metadata(
-                isbn13, hc_token, client, google_api_key=google_api_key
-            )
+    # No try/except around this block any more: every leg returns
+    # `transport_failed` rather than raising, and `_fetch_preview_cover`
+    # swallows everything of its own, so the old `httpx.TimeoutException` /
+    # `NetworkError` arms had become dead code that reads as live (G47). The
+    # connectivity card is rendered from the cascade outcome below; the
+    # separate "timed out — try again" wording collapses into it.
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        metadata, source, hc_ids, cascade = await items_common._lookup_metadata(
+            isbn13, hc_token, client, google_api_key=google_api_key
+        )
 
-            if not metadata:
-                preview_cover = await items_common._fetch_preview_cover(isbn13, client)
-                items_common._log_scan(isbn13, media_type, "not_found", mode=mode)
+        if not metadata:
+            # G47 applied to the book path: a cascade that could not reach
+            # anybody is not a book that does not exist. Only an Open
+            # Library exception used to reach this card; the other three
+            # legs swallowed their transport failures into `not_found`.
+            if cascade.outcome == "transport_failed":
+                logger.warning("Network error looking up ISBN %s", isbn13)
+                items_common._log_scan(isbn13, media_type, "error", mode=mode)
                 return templates.TemplateResponse(
                     request, "fragments/scan_result.html",
-                    {
-                        "status": "not_found", "isbn": isbn13, "media_type": media_type,
-                        "message": "Not found — add manually below",
-                        "preview_cover": preview_cover,
-                        # The same vocabulary the added-card notice uses, and no
-                        # provider name: four sources feed this cascade and any
-                        # subset can be starved, so naming one would be a guess.
-                        # Nothing else about this branch changes — the user's
-                        # options are the same, only the explanation is new.
-                        "enrich_status": "quota" if lookup_rate_limited else None,
-                        "locations": items_common._manual_form_locations(),
-                    },
+                    {"status": "error", "isbn": isbn13,
+                     "message": "Network error during lookup — check connectivity"},
                 )
 
-            item_id = items_common._save_item(metadata, isbn13, media_type, location_id, source, hc_ids)
+            preview_cover = await items_common._fetch_preview_cover(isbn13, client)
+            items_common._log_scan(isbn13, media_type, "not_found", mode=mode)
+            # The same vocabulary the added-card notice uses, projected
+            # from the cascade record — so `rejected` reaches the arm
+            # `fragments/scan_result.html` has always carried for it and
+            # the card can name the credential that was refused.
+            # `not_found_status`, not `enrich_status`: this card's own
+            # message already says "Not found", so a `no_match` notice
+            # would repeat it. Both UPC branches project the same way.
+            return templates.TemplateResponse(
+                request, "fragments/scan_result.html",
+                {
+                    "status": "not_found", "isbn": isbn13, "media_type": media_type,
+                    "message": "Not found — add manually below",
+                    "preview_cover": preview_cover,
+                    "enrich_status": scan_outcome.not_found_status(cascade),
+                    "enrich_provider": scan_outcome.provider_label(cascade),
+                    "locations": items_common._manual_form_locations(),
+                },
+            )
 
-            # Wishlist mode: set owned = 0
-            if mode == "wishlist":
-                with get_db() as db:
-                    db.execute("UPDATE items SET owned = 0 WHERE id = ?", (item_id,))
+        item_id = items_common._save_item(metadata, isbn13, media_type, location_id, source, hc_ids)
 
-            # Queue the cover instead of downloading it in-request. The
-            # hints are the exact three inputs the download used to take, so
-            # the worker runs the same chain this request would have.
-            hc_cover = metadata.get("cover_url") if source == "hardcover" else hc_ids.get("cover_url")
-            cover_queue.enqueue(item_id, hints={
-                "cover_url": metadata.get("cover_url") if source != "hardcover" else None,
-                "cover_id": metadata.get("cover_id"),
-                "hardcover_cover_url": hc_cover,
-            })
+        # Wishlist mode: set owned = 0
+        if mode == "wishlist":
+            with get_db() as db:
+                db.execute("UPDATE items SET owned = 0 WHERE id = ?", (item_id,))
 
-    except httpx.TimeoutException:
-        logger.warning("Timeout looking up ISBN %s", isbn13)
-        items_common._log_scan(isbn13, media_type, "error", mode=mode)
-        return templates.TemplateResponse(
-            request, "fragments/scan_result.html",
-            {"status": "error", "isbn": isbn13, "message": "Metadata lookup timed out — try again"},
-        )
-    except httpx.NetworkError:
-        logger.warning("Network error looking up ISBN %s", isbn13)
-        items_common._log_scan(isbn13, media_type, "error", mode=mode)
-        return templates.TemplateResponse(
-            request, "fragments/scan_result.html",
-            {"status": "error", "isbn": isbn13, "message": "Network error during lookup — check connectivity"},
-        )
+        # Queue the cover instead of downloading it in-request. The
+        # hints are the exact three inputs the download used to take, so
+        # the worker runs the same chain this request would have.
+        hc_cover = metadata.get("cover_url") if source == "hardcover" else hc_ids.get("cover_url")
+        cover_queue.enqueue(item_id, hints={
+            "cover_url": metadata.get("cover_url") if source != "hardcover" else None,
+            "cover_id": metadata.get("cover_id"),
+            "hardcover_cover_url": hc_cover,
+        })
+
 
     status = "wishlisted" if mode == "wishlist" else "added"
     items_common._log_scan(isbn13, media_type, status, item_id, mode)
@@ -496,8 +504,12 @@ async def manual_add(request: Request, _=Depends(require_role("editor"))):
         isbn13 = isbn10 = None
     else:
         upc_code = None
-        isbn13 = isbn_svc.to_isbn13(isbn) if isbn else None
-        isbn10 = isbn_svc.isbn13_to_isbn10(isbn13) if isbn13 else None
+        isbn13, isbn10 = isbn_svc.canonicalize_isbn_pair(isbn)
+        if isbn and not isbn13:
+            return templates.TemplateResponse(
+                request, "fragments/scan_result.html",
+                {"status": "error", "isbn": isbn, "message": "Invalid ISBN"},
+            )
     pub_year = form.get("publish_year")
     platform = form.get("platform") or None
     language = form.get("language", "").strip() or None
@@ -798,7 +810,8 @@ async def merge_items(request: Request, _=Depends(require_role("admin"))):
             return {"ok": False, "message": "Primary item not found"}
 
         _MERGE_FILLABLE = frozenset(["subtitle", "authors", "publisher", "publish_year", "page_count",
-                                      "description", "series_name", "narrator", "isbn"])
+                                      "description", "series_name", "narrator"])
+        primary_isbn = primary["isbn"]
         for mid in merge_ids:
             other = db.execute("SELECT * FROM items WHERE id = ?", (mid,)).fetchone()
             if not other:
@@ -806,6 +819,16 @@ async def merge_items(request: Request, _=Depends(require_role("admin"))):
             for field in _MERGE_FILLABLE:
                 if not primary[field] and other[field]:
                     db.execute(f"UPDATE items SET {field} = ? WHERE id = ?", (other[field], keep_id))
+
+            if not primary_isbn and (other["isbn"] or other["isbn10"]):
+                isbn_fields = canonicalize_isbn_fields(
+                    {"isbn": other["isbn"], "isbn10": other["isbn10"]}
+                )
+                db.execute(
+                    "UPDATE items SET isbn = ?, isbn10 = ? WHERE id = ?",
+                    (isbn_fields["isbn"], isbn_fields["isbn10"], keep_id),
+                )
+                primary_isbn = isbn_fields["isbn"]
 
             db.execute("UPDATE scan_log SET item_id = ? WHERE item_id = ?", (keep_id, mid))
             db.execute("UPDATE reading_log SET item_id = ? WHERE item_id = ?", (keep_id, mid))
@@ -837,6 +860,13 @@ async def update_item(request: Request, item_id: int, _=Depends(require_role("ed
                 fields[key] = int(val) if val else 0
             else:
                 fields[key] = val
+
+    if "isbn" in fields:
+        submitted_isbn = fields["isbn"]
+        isbn_fields = canonicalize_isbn_fields({"isbn": submitted_isbn})
+        if submitted_isbn and not isbn_fields["isbn"]:
+            return HTMLResponse("Invalid ISBN", status_code=400)
+        fields.update(isbn_fields)
 
     # Handle cover upload
     cover_file = form.get("cover")
@@ -1196,7 +1226,6 @@ async def test_igdb_key(request: Request, _=Depends(require_role("admin"))):
         return {"ok": False, "message": "Both Client ID and Client Secret are required"}
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         return await igdb.test_credentials(client_id, client_secret, client)
-
 
 
 

@@ -146,7 +146,7 @@ def test_item_edit_save(live_server, authed_page):
         live_server["data_dir"],
         title="Old Title",
         media_type="book",
-        isbn="9780000001234",
+        isbn="9780000001238",
     )
     authed_page.goto(f"{live_server['url']}/item/{item_id}/edit")
     authed_page.wait_for_load_state("networkidle")
@@ -167,7 +167,7 @@ def test_manual_value_overrides_estimate_then_falls_back(live_server, authed_pag
         live_server["data_dir"],
         title="Priced Book",
         media_type="book",
-        isbn="9780000005678",
+        isbn="9780000005670",
         estimated_value=20.00,
     )
 
@@ -292,7 +292,7 @@ def test_fractional_series_position_round_trips_in_browser(live_server, authed_p
         live_server["data_dir"],
         title="Novella At Two And A Quarter",
         media_type="book",
-        isbn="9780000009124",
+        isbn="9780000009128",
         series_name="Quarter Saga",
         series_position=2.25,
     )

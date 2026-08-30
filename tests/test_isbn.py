@@ -3,6 +3,7 @@
 import pytest
 
 from app.services.isbn import (
+    canonicalize_isbn_pair,
     normalize_isbn,
     isbn10_to_isbn13,
     to_isbn13,
@@ -73,6 +74,41 @@ class TestToIsbn13:
     def test_invalid_returns_none(self):
         assert to_isbn13("invalid") is None
         assert to_isbn13("12345") is None
+
+
+class TestCanonicalizeIsbnPair:
+    def test_valid_isbn10_becomes_canonical_pair(self):
+        assert canonicalize_isbn_pair("054792822X") == (
+            "9780547928227", "054792822X"
+        )
+
+    def test_valid_978_isbn13_derives_isbn10(self):
+        assert canonicalize_isbn_pair("9780441172719") == (
+            "9780441172719", "0441172717"
+        )
+
+    def test_valid_979_isbn13_has_no_isbn10(self):
+        assert canonicalize_isbn_pair("9791234567896") == (
+            "9791234567896", None
+        )
+
+    def test_invalid_checksums_are_rejected(self):
+        assert canonicalize_isbn_pair("9780441172710") == (None, None)
+        assert canonicalize_isbn_pair("0441172718") == (None, None)
+
+    def test_primary_value_wins_over_stale_companion(self):
+        assert canonicalize_isbn_pair("054792822X", "0441172717") == (
+            "9780547928227", "054792822X"
+        )
+
+    def test_isbn10_is_used_only_when_primary_is_empty(self):
+        assert canonicalize_isbn_pair(None, "0441172717") == (
+            "9780441172719", "0441172717"
+        )
+
+    def test_upc_conversion_contract_remains_separate(self):
+        assert to_isbn13("012345678905") == "0012345678905"
+        assert canonicalize_isbn_pair("012345678905") == (None, None)
 
 
 class TestValidateIsbn10:

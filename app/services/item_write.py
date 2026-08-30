@@ -22,6 +22,8 @@ follow-up writes (tags, scan log, cover path) to commit together, and
 
 from typing import Any, Mapping
 
+from app.services import isbn as isbn_svc
+
 #: Columns a caller may never set — the database owns them.
 _MANAGED = frozenset({"id"})
 
@@ -57,6 +59,24 @@ def reset_column_cache() -> None:
     _columns = None
 
 
+def canonicalize_isbn_fields(fields: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy *fields* and synchronize ISBN columns when either is present.
+
+    Callers that do not write an ISBN are left untouched, which is important
+    for partial updates.  When either identifier is part of the write, both
+    columns are emitted from the same checksum-valid canonical pair.  Invalid
+    input therefore becomes an absent identifier instead of contradictory or
+    ISBN-shaped persisted data.
+    """
+    values = dict(fields)
+    if "isbn" not in values and "isbn10" not in values:
+        return values
+    values["isbn"], values["isbn10"] = isbn_svc.canonicalize_isbn_pair(
+        values.get("isbn"), values.get("isbn10")
+    )
+    return values
+
+
 def insert_item(db, fields: Mapping[str, Any] | None = None, **kwargs) -> int:
     """Insert one row into `items` and return its id.
 
@@ -72,6 +92,7 @@ def insert_item(db, fields: Mapping[str, Any] | None = None, **kwargs) -> int:
     """
     values: dict[str, Any] = dict(fields or {})
     values.update(kwargs)
+    values = canonicalize_isbn_fields(values)
 
     if not values.get("title"):
         raise ValueError(

@@ -13,7 +13,12 @@ from pathlib import Path
 import pytest
 
 from app.database import get_db
-from app.services.item_write import insert_item, item_columns, reset_column_cache
+from app.services.item_write import (
+    canonicalize_isbn_fields,
+    insert_item,
+    item_columns,
+    reset_column_cache,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 APP_DIR = REPO_ROOT / "app"
@@ -53,12 +58,40 @@ class TestInsertItem:
         assert row["title"] == "Dune"
 
     def test_accepts_dict_kwargs_or_both(self, db):
-        a = insert_item(db, {"title": "A", "isbn": "9780000000001"})
-        b = insert_item(db, title="B", isbn="9780000000002")
-        c = insert_item(db, {"title": "C"}, isbn="9780000000003")
-        for item_id, isbn in ((a, "9780000000001"), (b, "9780000000002"), (c, "9780000000003")):
+        a = insert_item(db, {"title": "A", "isbn": "9780441172719"})
+        b = insert_item(db, title="B", isbn="9780547928227")
+        c = insert_item(db, {"title": "C"}, isbn="9791234567896")
+        for item_id, isbn in ((a, "9780441172719"), (b, "9780547928227"), (c, "9791234567896")):
             row = db.execute("SELECT isbn FROM items WHERE id = ?", (item_id,)).fetchone()
             assert row["isbn"] == isbn
+
+    def test_canonicalizes_and_synchronizes_isbn_columns(self, db):
+        item_id = insert_item(
+            db,
+            title="Canonical",
+            isbn="054792822X",
+            isbn10="0441172717",
+        )
+        row = db.execute(
+            "SELECT isbn, isbn10 FROM items WHERE id = ?", (item_id,)
+        ).fetchone()
+        assert (row["isbn"], row["isbn10"]) == ("9780547928227", "054792822X")
+
+    def test_invalid_isbn_fields_are_not_persisted(self, db):
+        item_id = insert_item(
+            db,
+            title="Bad checksum",
+            isbn="9780441172710",
+            isbn10="0441172717",
+        )
+        row = db.execute(
+            "SELECT isbn, isbn10 FROM items WHERE id = ?", (item_id,)
+        ).fetchone()
+        assert (row["isbn"], row["isbn10"]) == (None, None)
+
+    def test_non_isbn_partial_update_fields_are_untouched(self):
+        fields = {"title": "Only title"}
+        assert canonicalize_isbn_fields(fields) == fields
 
     def test_kwargs_win_over_the_dict(self, db):
         item_id = insert_item(db, {"title": "from dict"}, title="from kwarg")
@@ -109,9 +142,9 @@ class TestLoudFailures:
     def test_integrity_errors_still_reach_the_caller(self, db):
         """Sites catch IntegrityError to show a duplicate card rather than a
         500 — the wrapper must not swallow it."""
-        insert_item(db, title="First", isbn="9780000000010", media_type="book")
+        insert_item(db, title="First", isbn="9780441172719", media_type="book")
         with pytest.raises(sqlite3.IntegrityError):
-            insert_item(db, title="Second", isbn="9780000000010", media_type="book")
+            insert_item(db, title="Second", isbn="9780441172719", media_type="book")
 
 
 class TestColumnDiscovery:

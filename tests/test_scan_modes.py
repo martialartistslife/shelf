@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from app.database import get_db
+from app.services import provider_result
 from tests.conftest import _insert_item, _insert_borrower, _insert_location
 
 
@@ -12,10 +13,10 @@ class TestAddMode:
     """Default add mode — existing behavior, smoke tests."""
 
     def test_add_duplicate_returns_duplicate(self, admin_client, db):
-        item_id = _insert_item(db, title="Existing Book", isbn="9780000000001")
+        item_id = _insert_item(db, title="Existing Book", isbn="9780000000002")
         db.commit()
         resp = admin_client.post("/api/scan", data={
-            "isbn": "9780000000001", "media_type": "book", "mode": "add",
+            "isbn": "9780000000002", "media_type": "book", "mode": "add",
         })
         assert resp.status_code == 200
         assert b"duplicate" in resp.content
@@ -257,21 +258,21 @@ class TestQuickRateMode:
 class TestGoogleBooksCredentialPropagation:
     def test_env_key_reaches_scan_lookup(self, admin_client, monkeypatch):
         monkeypatch.setenv("GOOGLE_BOOKS_API_KEY", "scan-google-key")
-        lookup = AsyncMock(return_value=(None, "manual", {}, False))
+        lookup = AsyncMock(return_value=(None, "manual", {}, provider_result.no_match("openlibrary")))
         with patch("app.routers.items_common._lookup_metadata", new=lookup), \
              patch("app.routers.items_common._fetch_preview_cover", new=AsyncMock(return_value=None)):
             admin_client.post("/api/scan", data={
-                "isbn": "9780000099986", "media_type": "book", "mode": "add",
+                "isbn": "9780000099983", "media_type": "book", "mode": "add",
             })
 
         assert lookup.await_args.kwargs["google_api_key"] == "scan-google-key"
 
     def test_env_key_reaches_add_by_isbn_lookup(self, editor_client, monkeypatch):
         monkeypatch.setenv("GOOGLE_BOOKS_API_KEY", "add-google-key")
-        lookup = AsyncMock(return_value=(None, "manual", {}, False))
+        lookup = AsyncMock(return_value=(None, "manual", {}, provider_result.no_match("openlibrary")))
         with patch("app.routers.items_common._lookup_metadata", new=lookup):
             editor_client.post("/api/books/add", data={
-                "isbn": "9780000099979", "media_type": "book",
+                "isbn": "9780000099976", "media_type": "book",
             })
 
         assert lookup.await_args.kwargs["google_api_key"] == "add-google-key"
@@ -284,13 +285,13 @@ class TestManualAddForm:
     def _scan_unknown(self, client):
         with patch(
             "app.routers.items_common._lookup_metadata",
-            new=AsyncMock(return_value=(None, "", {}, False)),
+            new=AsyncMock(return_value=(None, "", {}, provider_result.no_match("openlibrary"))),
         ), patch(
             "app.routers.items_common._fetch_preview_cover",
             new=AsyncMock(return_value=None),
         ):
             return client.post("/api/scan", data={
-                "isbn": "9780000099993", "media_type": "book", "mode": "add",
+                "isbn": "9780000099990", "media_type": "book", "mode": "add",
             })
 
     def test_manual_form_has_copy_picker_and_new_fields(self, admin_client, db):
@@ -354,7 +355,7 @@ class TestScanCoverQueue:
     def _scan(self, client, isbn, metadata, source="openlibrary", hc_ids=None, mode="add"):
         with patch(
             "app.routers.items_common._lookup_metadata",
-            AsyncMock(return_value=(metadata, source, hc_ids or {}, False)),
+            AsyncMock(return_value=(metadata, source, hc_ids or {}, provider_result.found("openlibrary", metadata))),
         ), patch(
             "app.services.covers.download_cover", AsyncMock(return_value="covers/x.jpg")
         ) as download:
@@ -393,7 +394,7 @@ class TestScanCoverQueue:
         from app.services import cover_queue
 
         metadata = {"title": "Polled Book", "authors": "A. Writer", "cover_id": 5}
-        resp, _ = self._scan(admin_client, "9780000000102", metadata)
+        resp, _ = self._scan(admin_client, "9780000000101", metadata)
         job = cover_queue._get_queue().get_nowait()
 
         html = resp.text
@@ -406,7 +407,7 @@ class TestScanCoverQueue:
 
         metadata = {"title": "HC Book", "authors": "A. Writer",
                     "cover_url": "https://hc.test/c.jpg"}
-        self._scan(admin_client, "9780000000103", metadata, source="hardcover")
+        self._scan(admin_client, "9780000000118", metadata, source="hardcover")
 
         job = cover_queue._get_queue().get_nowait()
         assert job.hints["cover_url"] is None
@@ -416,7 +417,7 @@ class TestScanCoverQueue:
         from app.services import cover_queue
 
         metadata = {"title": "Wanted Book", "authors": "A. Writer"}
-        resp, _ = self._scan(admin_client, "9780000000104", metadata, mode="wishlist")
+        resp, _ = self._scan(admin_client, "9780000000125", metadata, mode="wishlist")
         assert resp.status_code == 200
 
         job = cover_queue._get_queue().get_nowait()
@@ -501,7 +502,8 @@ class TestTheBarcodeOutranksTheDropdown:
         from app.routers import items_common
 
         async def _lookup(isbn13, hc_token, client, *, google_api_key=None):
-            return ({"title": "A Real Novel", "authors": "Someone"}, "openlibrary", {}, False)
+            meta = {"title": "A Real Novel", "authors": "Someone"}
+            return (meta, "openlibrary", {}, provider_result.found("openlibrary", meta))
 
         monkeypatch.setattr(items_common, "_lookup_metadata", _lookup)
 
