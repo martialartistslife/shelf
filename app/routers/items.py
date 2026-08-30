@@ -426,45 +426,71 @@ async def scan_isbn(
             )
         else:
             legacy_resolution = await _verify_legacy_book_barcode(raw)
-            if legacy_resolution.outcome == "ambiguous":
-                confirmed = isbn_svc.normalize_isbn(legacy_confirm_isbn13)
-                selected = None
-                if confirmed and isbn_svc.validate_isbn13(confirmed):
-                    selected = next(
-                        (
-                            match
-                            for match in legacy_resolution.matches
-                            if match.isbn13 == confirmed
+            confirmed = isbn_svc.normalize_isbn(legacy_confirm_isbn13)
+            selected = None
+            if confirmed and isbn_svc.validate_isbn13(confirmed):
+                selected = next(
+                    (
+                        match
+                        for match in legacy_resolution.matches
+                        if match.isbn13 == confirmed
+                    ),
+                    None,
+                )
+            confirmation_accepted = (
+                bool(legacy_confirm_isbn13)
+                and legacy_resolution.outcome in {"found", "ambiguous"}
+                and selected is not None
+            )
+
+            if legacy_resolution.outcome == "ambiguous" and not confirmation_accepted:
+                if legacy_confirm_isbn13:
+                    logger.warning(
+                        "Rejected unverified legacy UPC+5 confirmation %s -> %s",
+                        raw,
+                        legacy_confirm_isbn13,
+                    )
+                # Do not log this as a failed scan. The operation is paused
+                # for a deliberate identity choice and will be logged once
+                # that choice completes the original mode.
+                return templates.TemplateResponse(
+                    request,
+                    "fragments/scan_result.html",
+                    {
+                        "status": "legacy_ambiguous",
+                        "isbn": raw,
+                        "message": _legacy_resolution_message(legacy_resolution),
+                        "legacy_candidates": _legacy_choice_context(legacy_resolution),
+                        "media_type": media_type,
+                        "location_id": location_id,
+                        "platform": platform,
+                        "mode": mode,
+                        "borrower_id": borrower_id,
+                    },
+                )
+
+            if legacy_confirm_isbn13 and not confirmation_accepted:
+                logger.warning(
+                    "Rejected stale or unverifiable legacy UPC+5 confirmation %s -> %s",
+                    raw,
+                    legacy_confirm_isbn13,
+                )
+                items_common._log_scan(raw, "book", "error", mode=mode)
+                return templates.TemplateResponse(
+                    request,
+                    "fragments/scan_result.html",
+                    {
+                        "status": "error",
+                        "isbn": raw,
+                        "message": (
+                            "Couldn’t safely verify the selected book right now — "
+                            "scan the printed ISBN or try again"
                         ),
-                        None,
-                    )
+                    },
+                )
 
-                if selected is None:
-                    if legacy_confirm_isbn13:
-                        logger.warning(
-                            "Rejected unverified legacy UPC+5 confirmation %s -> %s",
-                            raw,
-                            legacy_confirm_isbn13,
-                        )
-                    # Do not log this as a failed scan. The operation is paused
-                    # for a deliberate identity choice and will be logged once
-                    # that choice completes the original mode.
-                    return templates.TemplateResponse(
-                        request,
-                        "fragments/scan_result.html",
-                        {
-                            "status": "legacy_ambiguous",
-                            "isbn": raw,
-                            "message": _legacy_resolution_message(legacy_resolution),
-                            "legacy_candidates": _legacy_choice_context(legacy_resolution),
-                            "media_type": media_type,
-                            "location_id": location_id,
-                            "platform": platform,
-                            "mode": mode,
-                            "borrower_id": borrower_id,
-                        },
-                    )
-
+            if confirmation_accepted:
+                assert selected is not None
                 _save_confirmed_legacy_mapping(raw, selected.isbn13)
                 legacy_isbn13 = selected.isbn13
                 legacy_metadata = selected.metadata
@@ -1448,5 +1474,4 @@ async def test_igdb_key(request: Request, _=Depends(require_role("admin"))):
         return {"ok": False, "message": "Both Client ID and Client Secret are required"}
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         return await igdb.test_credentials(client_id, client_secret, client)
-
 

@@ -1,5 +1,9 @@
 """Regression coverage for legacy price-point UPC-A + 5 book barcodes."""
 
+import sqlite3
+
+import pytest
+
 from app.services import legacy_book
 from app.services import upc as upc_svc
 
@@ -64,3 +68,19 @@ def test_unknown_publisher_prefix_is_not_guessed():
     # Valid UPC-A followed by a five-digit supplement, but no verified
     # publisher mapping. Refusing to guess is part of the contract.
     assert legacy_book.isbn13_candidates("03600029145243506") == ()
+
+
+@pytest.mark.parametrize(
+    ("barcode", "isbn13"),
+    [
+        ("0780730039904489X", "9780439448918"),
+        ("07807300399044891", "978043944891X"),
+        ("07807300399044891", "9770439448918"),
+    ],
+)
+def test_mapping_table_rejects_noncanonical_values(db, barcode, isbn13):
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute(
+            "INSERT INTO legacy_book_mappings (barcode, isbn13) VALUES (?, ?)",
+            (barcode, isbn13),
+        )

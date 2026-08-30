@@ -204,6 +204,176 @@ class TestLegacyBookScan:
             "SELECT id FROM items WHERE isbn = ?", (KRISTY_ISBN13,)
         ).fetchone() is None
 
+    def test_stale_confirmation_cannot_switch_to_a_different_unique_match(
+        self, admin_client, db
+    ):
+        async def lookup(isbn, hc_token, client, *, google_api_key=None):
+            if isbn == HOUND_OTHER_ISBN13:
+                return _hound_lookup_result(isbn)
+            return None, "manual", {}, provider_result.no_match("openlibrary")
+
+        with patch(
+            "app.routers.items_common._lookup_metadata",
+            new=AsyncMock(side_effect=lookup),
+        ), patch("app.routers.items.cover_queue.enqueue") as enqueue:
+            resp = admin_client.post("/api/scan", data={
+                "isbn": HOUND_UPC5,
+                "media_type": "book",
+                "mode": "add",
+                "legacy_confirm_isbn13": HOUND_ISBN13,
+            })
+
+        assert resp.status_code == 200
+        assert "Couldn" in resp.text
+        assert "safely verify the selected book" in resp.text
+        enqueue.assert_not_called()
+        assert db.execute(
+            "SELECT isbn13 FROM legacy_book_mappings WHERE barcode = ?",
+            (HOUND_UPC5,),
+        ).fetchone() is None
+        assert db.execute(
+            "SELECT id FROM items WHERE isbn IN (?, ?)",
+            (HOUND_ISBN13, HOUND_OTHER_ISBN13),
+        ).fetchone() is None
+
+    def test_selected_candidate_can_be_learned_after_it_becomes_unique(
+        self, admin_client, db
+    ):
+        async def lookup(isbn, hc_token, client, *, google_api_key=None):
+            if isbn == HOUND_ISBN13:
+                return _hound_lookup_result(isbn)
+            return None, "manual", {}, provider_result.no_match("openlibrary")
+
+        with patch(
+            "app.routers.items_common._lookup_metadata",
+            new=AsyncMock(side_effect=lookup),
+        ), patch("app.routers.items.cover_queue.enqueue"):
+            resp = admin_client.post("/api/scan", data={
+                "isbn": HOUND_UPC5,
+                "media_type": "book",
+                "mode": "add",
+                "legacy_confirm_isbn13": HOUND_ISBN13,
+            })
+
+        assert resp.status_code == 200
+        assert "Hound at the Hospital" in resp.text
+        mapping = db.execute(
+            "SELECT isbn13 FROM legacy_book_mappings WHERE barcode = ?",
+            (HOUND_UPC5,),
+        ).fetchone()
+        assert mapping is not None
+        assert mapping["isbn13"] == HOUND_ISBN13
+
+    @pytest.mark.parametrize(
+        ("mode", "barcode", "expected_owned"),
+        [
+            ("add", HOUND_UPC5, 1),
+            ("wishlist", HOUND_EAN13_PLUS5, 0),
+        ],
+    )
+    def test_remembered_mapping_applies_to_creating_modes_without_candidate_recheck(
+        self, admin_client, db, mode, barcode, expected_owned
+    ):
+        db.execute(
+            "INSERT INTO legacy_book_mappings (barcode, isbn13) VALUES (?, ?)",
+            (HOUND_UPC5, HOUND_ISBN13),
+        )
+        db.commit()
+
+        async def lookup(isbn, hc_token, client, *, google_api_key=None):
+            assert isbn == HOUND_ISBN13
+            return _hound_lookup_result(isbn)
+
+        lookup_mock = AsyncMock(side_effect=lookup)
+        with patch("app.routers.items_common._lookup_metadata", new=lookup_mock), \
+             patch("app.routers.items.cover_queue.enqueue"):
+            resp = admin_client.post("/api/scan", data={
+                "isbn": barcode,
+                "media_type": "book",
+                "mode": mode,
+            })
+
+        assert resp.status_code == 200
+        assert "Hound at the Hospital" in resp.text
+        assert lookup_mock.await_count == 1
+        row = db.execute(
+            "SELECT isbn, isbn10, owned FROM items WHERE isbn = ?",
+            (HOUND_ISBN13,),
+        ).fetchone()
+        assert row is not None
+        assert row["isbn"] == HOUND_ISBN13
+        assert row["isbn10"] == "0439448913"
+        assert row["owned"] == expected_owned
+
+    def test_remembered_mapping_applies_to_every_existing_item_mode(
+        self, admin_client, db
+    ):
+        home = _insert_location(db, "Home")
+        target = _insert_location(db, "Target")
+        borrower = _insert_borrower(db, "Reader")
+        item_id = _insert_item(
+            db,
+            title="Hound at the Hospital",
+            isbn=HOUND_ISBN13,
+            location_id=home,
+        )
+        db.execute(
+            "INSERT INTO legacy_book_mappings (barcode, isbn13) VALUES (?, ?)",
+            (HOUND_UPC5, HOUND_ISBN13),
+        )
+        db.commit()
+
+        no_lookup = AsyncMock(side_effect=AssertionError("mapping should win"))
+        with patch("app.routers.items_common._lookup_metadata", new=no_lookup):
+            lend = admin_client.post("/api/scan", data={
+                "isbn": HOUND_UPC5,
+                "mode": "lend",
+                "borrower_id": str(borrower),
+            })
+            returned = admin_client.post("/api/scan", data={
+                "isbn": HOUND_EAN13_PLUS5,
+                "mode": "return",
+            })
+            moved = admin_client.post("/api/scan", data={
+                "isbn": HOUND_UPC5,
+                "mode": "move",
+                "location_id": str(target),
+            })
+            inventoried = admin_client.post("/api/scan", data={
+                "isbn": HOUND_EAN13_PLUS5,
+                "mode": "inventory",
+                "location_id": str(home),
+            })
+            looked_up = admin_client.post("/api/scan", data={
+                "isbn": HOUND_UPC5,
+                "mode": "lookup",
+            })
+            rated = admin_client.post("/api/scan", data={
+                "isbn": HOUND_EAN13_PLUS5,
+                "mode": "quick_rate",
+            })
+
+        assert "Lent to Reader" in lend.text
+        assert "Returned from Reader" in returned.text
+        assert b"moved" in moved.content
+        assert b"relocated" in inventoried.content
+        assert "Hound at the Hospital" in looked_up.text
+        assert "Marked as read" in rated.text
+        no_lookup.assert_not_awaited()
+
+        row = db.execute(
+            "SELECT location_id, reading_status, date_finished FROM items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        assert row["location_id"] == home
+        assert row["reading_status"] == "read"
+        assert row["date_finished"] is not None
+        checkout = db.execute(
+            "SELECT checked_in FROM checkouts WHERE item_id = ?", (item_id,)
+        ).fetchone()
+        assert checkout is not None
+        assert checkout["checked_in"] is not None
+
     def test_unchecked_candidate_prevents_a_confident_guess(self, admin_client, db):
         correct = _metadata("Kristy and the Mother's Day Surprise")
 
@@ -238,6 +408,24 @@ class TestLegacyBookScan:
         enqueue.assert_not_called()
         assert db.execute(
             "SELECT id FROM items WHERE isbn = ?", (KRISTY_ISBN13,)
+        ).fetchone() is None
+
+        with patch(
+            "app.routers.items_common._lookup_metadata",
+            new=AsyncMock(side_effect=lookup),
+        ), patch("app.routers.items.cover_queue.enqueue") as confirm_enqueue:
+            confirmed = admin_client.post("/api/scan", data={
+                "isbn": KRISTY_UPC5,
+                "media_type": "book",
+                "mode": "add",
+                "legacy_confirm_isbn13": KRISTY_ISBN13,
+            })
+
+        assert "safely verify the selected book" in confirmed.text
+        confirm_enqueue.assert_not_called()
+        assert db.execute(
+            "SELECT isbn13 FROM legacy_book_mappings WHERE barcode = ?",
+            (KRISTY_UPC5,),
         ).fetchone() is None
 
     @pytest.mark.parametrize("barcode", [KRISTY_UPC5, KRISTY_EAN13_PLUS5])
