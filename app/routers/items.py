@@ -81,26 +81,7 @@ def _find_duplicate_item(db, isbn13: str | None, upc_code: str | None, media_typ
 
 
 def _find_item_by_barcode(raw: str) -> dict | None:
-    """Find an existing item by ISBN, UPC, or supported legacy book barcode."""
-    legacy_candidates = legacy_book.isbn13_candidates(raw)
-    if legacy_candidates:
-        matches: dict[int, dict] = {}
-        with get_db() as db:
-            for candidate in legacy_candidates:
-                item = db.execute(
-                    "SELECT i.*, l.name as location_name FROM items i "
-                    "LEFT JOIN locations l ON i.location_id = l.id WHERE i.isbn = ?",
-                    (candidate,),
-                ).fetchone()
-                if item:
-                    matches[item["id"]] = dict(item)
-        # One candidate already in the collection is enough for the
-        # non-creating scan modes. If both candidates exist, refusing
-        # to guess is safer than operating on the wrong copy.
-        if len(matches) == 1:
-            return next(iter(matches.values()))
-        return None
-
+    """Find an existing item by an ordinary ISBN or UPC barcode."""
     barcode_type = upc_svc.detect_barcode_type(raw)
     # to_isbn13() zero-pads a UPC-A into an ISBN-shaped string, so a UPC must
     # not be looked up against items.isbn — that is what mis-filed them (#20).
@@ -125,6 +106,44 @@ def _find_item_by_barcode(raw: str) -> dict | None:
             if item:
                 return dict(item)
     return None
+
+
+async def _verify_legacy_book_barcode(raw: str) -> legacy_book.LegacyBookResolution:
+    """Resolve every supported legacy scan through the normal book cascade."""
+    with get_db() as db:
+        hc_token = get_setting(db, "hardcover_token") or None
+        google_api_key = get_setting(db, "google_books_api_key") or None
+
+    candidates = legacy_book.isbn13_candidates(raw)
+    logger.info(
+        "Resolving legacy UPC+5 %s through ISBN candidates %s",
+        raw,
+        ", ".join(candidates),
+    )
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        async def lookup_candidate(candidate: str):
+            return await items_common._lookup_metadata(
+                candidate,
+                hc_token,
+                client,
+                google_api_key=google_api_key,
+            )
+
+        return await legacy_book.resolve(raw, lookup_candidate)
+
+
+def _legacy_resolution_message(resolution: legacy_book.LegacyBookResolution) -> str:
+    if resolution.outcome == "ambiguous":
+        return "Older book barcode matches more than one book — scan the printed ISBN"
+    if resolution.outcome == "inconclusive":
+        return (
+            "Couldn’t safely verify this older book barcode right now — "
+            "try again later or scan the printed ISBN"
+        )
+    return (
+        "Older book barcode recognized, but no unique book match was found — "
+        "scan the printed ISBN"
+    )
 
 
 def _scan_mode_lend(request, templates, item: dict, borrower_id: int | None, raw: str):
@@ -322,9 +341,28 @@ async def scan_isbn(
     templates = request.app.state.templates
     raw = isbn.strip()
 
+    legacy_resolution = None
+    if legacy_book.isbn13_candidates(raw):
+        legacy_resolution = await _verify_legacy_book_barcode(raw)
+        if legacy_resolution.outcome != "found":
+            items_common._log_scan(raw, "book", "error", mode=mode)
+            return templates.TemplateResponse(
+                request,
+                "fragments/scan_result.html",
+                {
+                    "status": "error",
+                    "isbn": raw,
+                    "message": _legacy_resolution_message(legacy_resolution),
+                },
+            )
+
     # --- Modes that operate on existing items ---
     if mode in _EXISTING_ITEM_MODES:
-        item = _find_item_by_barcode(raw)
+        lookup_barcode = (
+            legacy_resolution.isbn13 if legacy_resolution is not None else raw
+        )
+        assert lookup_barcode is not None
+        item = _find_item_by_barcode(lookup_barcode)
         # inventory mode handles not-found specially
         if mode == "inventory":
             return _scan_mode_inventory(request, templates, item, location_id, raw)
@@ -350,53 +388,8 @@ async def scan_isbn(
     # UPC plus a five-digit title supplement. The main UPC is shared by
     # many books, so never send it down the ordinary product path and
     # never pick an ISBN candidate merely because it looks plausible.
-    legacy_resolution = None
-    legacy_candidates = legacy_book.isbn13_candidates(raw)
-    if legacy_candidates:
+    if legacy_resolution is not None:
         barcode_type = "isbn"
-        with get_db() as db:
-            legacy_hc_token = get_setting(db, "hardcover_token") or None
-            legacy_google_api_key = get_setting(db, "google_books_api_key") or None
-
-        logger.info(
-            "Resolving legacy UPC+5 %s through ISBN candidates %s",
-            raw,
-            ", ".join(legacy_candidates),
-        )
-        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as legacy_client:
-            async def lookup_candidate(candidate: str):
-                return await items_common._lookup_metadata(
-                    candidate,
-                    legacy_hc_token,
-                    legacy_client,
-                    google_api_key=legacy_google_api_key,
-                )
-
-            legacy_resolution = await legacy_book.resolve(raw, lookup_candidate)
-
-        if legacy_resolution.outcome != "found":
-            if legacy_resolution.outcome == "ambiguous":
-                message = (
-                    "Older book barcode matches more than one book — "
-                    "scan the printed ISBN"
-                )
-            elif legacy_resolution.outcome == "inconclusive":
-                message = (
-                    "Couldn’t safely verify this older book barcode right now — "
-                    "try again later or scan the printed ISBN"
-                )
-            else:
-                message = (
-                    "Older book barcode recognized, but no unique book match was found — "
-                    "scan the printed ISBN"
-                )
-            items_common._log_scan(raw, "book", "error", mode=mode)
-            return templates.TemplateResponse(
-                request,
-                "fragments/scan_result.html",
-                {"status": "error", "isbn": raw, "message": message},
-            )
-
         assert legacy_resolution.isbn13 is not None
         assert legacy_resolution.metadata is not None
         isbn13 = legacy_resolution.isbn13
@@ -1316,7 +1309,6 @@ async def test_igdb_key(request: Request, _=Depends(require_role("admin"))):
         return {"ok": False, "message": "Both Client ID and Client Secret are required"}
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         return await igdb.test_credentials(client_id, client_secret, client)
-
 
 
 

@@ -38,6 +38,17 @@ def test_formatting_between_upc_and_supplement_is_accepted():
     )
 
 
+def test_zero_padded_ean13_scanner_representation_is_accepted():
+    assert legacy_book.isbn13_candidates("007807300350143506") == (
+        "9780590435062",
+        "9780439435062",
+    )
+
+
+def test_arbitrary_ean13_plus_supplement_is_not_reinterpreted_as_upca():
+    assert legacy_book.parse("107807300350143506") is None
+
+
 def test_invalid_upc_check_digit_is_not_treated_as_legacy_book():
     assert legacy_book.parse("07807300350243506") is None
     assert legacy_book.isbn13_candidates("07807300350243506") == ()

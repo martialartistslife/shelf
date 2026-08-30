@@ -63,8 +63,16 @@ _PUBLISHER_PREFIXES: dict[str, tuple[str, ...]] = {
 
 
 def parse(raw: str) -> LegacyBookBarcode | None:
-    """Parse a supported 12-digit price-point UPC plus five-digit supplement."""
+    """Parse a supported price-point UPC-A plus five-digit supplement.
+
+    Some scanners emit UPC-A as its equivalent EAN-13 representation by
+    prepending zero. Accept that exact 18-digit representation, but never
+    strip a non-zero EAN-13 prefix: arbitrary EAN-13 + 5 barcodes are outside
+    this evidence-backed legacy format.
+    """
     digits = upc_svc.normalize_barcode(raw)
+    if len(digits) == 18 and digits.startswith("0"):
+        digits = digits[1:]
     if len(digits) != 17:
         return None
 
