@@ -32,6 +32,17 @@ class LegacyBookBarcode:
     isbn10_prefixes: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class LegacyBookMatch:
+    """One candidate that the normal metadata cascade positively verified."""
+
+    isbn13: str
+    metadata: dict[str, Any]
+    source: str
+    hc_ids: dict[str, Any]
+    cascade: Any
+
+
 ResolutionOutcome = Literal[
     "not_legacy",
     "found",
@@ -45,6 +56,7 @@ ResolutionOutcome = Literal[
 class LegacyBookResolution:
     outcome: ResolutionOutcome
     candidates: tuple[str, ...] = ()
+    matches: tuple[LegacyBookMatch, ...] = ()
     isbn13: str | None = None
     metadata: dict[str, Any] | None = None
     source: str = "manual"
@@ -86,6 +98,20 @@ def parse(raw: str) -> LegacyBookBarcode | None:
         return None
 
     return LegacyBookBarcode(upc=upc, supplement=supplement, isbn10_prefixes=prefixes)
+
+
+def mapping_key(raw: str) -> str | None:
+    """Canonical 17-digit key for a supported legacy barcode.
+
+    UPC-A and its exact zero-padded EAN-13 scanner representation must learn
+    the same identity. Returning the parsed UPC plus supplement gives both
+    forms one stable database key without broadening support to arbitrary
+    EAN-13 + 5 barcodes.
+    """
+    barcode = parse(raw)
+    if barcode is None:
+        return None
+    return barcode.upc + barcode.supplement
 
 
 def _isbn10_check_digit(body9: str) -> str:
@@ -134,38 +160,56 @@ async def resolve(raw: str, lookup: Lookup) -> LegacyBookResolution:
     rate limit, or transport failure on any non-winning candidate makes the
     whole decision inconclusive: Shelf must not call one candidate unique
     merely because it could not actually check another candidate.
+
+    When more than one candidate is positively verified, ``matches`` carries
+    the verified metadata needed to ask the user which physical book they
+    actually have. Merely generated candidates never become selectable.
     """
     candidates = isbn13_candidates(raw)
     if not candidates:
         return LegacyBookResolution("not_legacy")
 
-    matches: list[tuple[str, dict[str, Any], str, dict[str, Any], Any]] = []
+    matches: list[LegacyBookMatch] = []
     inconclusive = False
 
     for candidate in candidates:
         metadata, source, hc_ids, cascade = await lookup(candidate)
         if metadata:
-            matches.append((candidate, metadata, source, hc_ids, cascade))
+            matches.append(
+                LegacyBookMatch(
+                    isbn13=candidate,
+                    metadata=metadata,
+                    source=source,
+                    hc_ids=hc_ids,
+                    cascade=cascade,
+                )
+            )
             continue
 
         outcome = getattr(cascade, "outcome", "no_match")
         if outcome not in {"no_match", "no_credential"}:
             inconclusive = True
 
+    verified = tuple(matches)
     if inconclusive:
-        return LegacyBookResolution("inconclusive", candidates=candidates)
+        return LegacyBookResolution(
+            "inconclusive", candidates=candidates, matches=verified
+        )
     if len(matches) > 1:
-        return LegacyBookResolution("ambiguous", candidates=candidates)
+        return LegacyBookResolution(
+            "ambiguous", candidates=candidates, matches=verified
+        )
     if not matches:
         return LegacyBookResolution("not_found", candidates=candidates)
 
-    isbn13, metadata, source, hc_ids, cascade = matches[0]
+    match = matches[0]
     return LegacyBookResolution(
         "found",
         candidates=candidates,
-        isbn13=isbn13,
-        metadata=metadata,
-        source=source,
-        hc_ids=hc_ids,
-        cascade=cascade,
+        matches=verified,
+        isbn13=match.isbn13,
+        metadata=match.metadata,
+        source=match.source,
+        hc_ids=match.hc_ids,
+        cascade=match.cascade,
     )
