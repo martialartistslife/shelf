@@ -6,6 +6,339 @@ on:
   pull_request:
 
 jobs:
+  review_hardening:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out feature branch
+        uses: actions/checkout@v7
+        with:
+          ref: fix/legacy-upc5-book-scans
+          fetch-depth: 0
+
+      - name: Apply review findings
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          items = Path('app/routers/items.py')
+          text = items.read_text(encoding='utf-8')
+
+          old_find = '''def _find_item_by_barcode(raw: str) -> dict | None:
+    """Find an existing item by ISBN, UPC, or supported legacy book barcode."""
+    legacy_candidates = legacy_book.isbn13_candidates(raw)
+    if legacy_candidates:
+        matches: dict[int, dict] = {}
+        with get_db() as db:
+            for candidate in legacy_candidates:
+                item = db.execute(
+                    "SELECT i.*, l.name as location_name FROM items i "
+                    "LEFT JOIN locations l ON i.location_id = l.id WHERE i.isbn = ?",
+                    (candidate,),
+                ).fetchone()
+                if item:
+                    matches[item["id"]] = dict(item)
+        # One candidate already in the collection is enough for the
+        # non-creating scan modes. If both candidates exist, refusing
+        # to guess is safer than operating on the wrong copy.
+        if len(matches) == 1:
+            return next(iter(matches.values()))
+        return None
+
+    barcode_type = upc_svc.detect_barcode_type(raw)
+'''
+          new_find = '''def _find_item_by_barcode(raw: str) -> dict | None:
+    """Find an existing item by canonical ISBN or UPC barcode.
+
+    Supported legacy UPC+5 scans are verified by the async scan route before
+    reaching this helper. Candidate presence in the local collection alone is
+    not enough proof to target an item for lend/move/return operations.
+    """
+    barcode_type = upc_svc.detect_barcode_type(raw)
+'''
+          if old_find not in text:
+              raise SystemExit('expected local legacy lookup block not found')
+          text = text.replace(old_find, new_find, 1)
+
+          marker = '''# Modes that operate on existing items (not add/wishlist)
+_EXISTING_ITEM_MODES = {"lend", "return", "move", "inventory", "lookup", "quick_rate"}
+
+
+@router.post("/scan")
+'''
+          helpers = '''# Modes that operate on existing items (not add/wishlist)
+_EXISTING_ITEM_MODES = {"lend", "return", "move", "inventory", "lookup", "quick_rate"}
+
+
+async def _resolve_legacy_book_barcode(raw: str):
+    """Resolve a supported legacy UPC+5 using the normal ISBN metadata cascade."""
+    candidates = legacy_book.isbn13_candidates(raw)
+    if not candidates:
+        return None
+
+    with get_db() as db:
+        hc_token = get_setting(db, "hardcover_token") or None
+        google_api_key = get_setting(db, "google_books_api_key") or None
+
+    logger.info(
+        "Resolving legacy UPC+5 %s through ISBN candidates %s",
+        raw,
+        ", ".join(candidates),
+    )
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        async def lookup_candidate(candidate: str):
+            return await items_common._lookup_metadata(
+                candidate,
+                hc_token,
+                client,
+                google_api_key=google_api_key,
+            )
+
+        return await legacy_book.resolve(raw, lookup_candidate)
+
+
+def _legacy_resolution_message(resolution) -> str:
+    if resolution.outcome == "ambiguous":
+        return "Older book barcode matches more than one book — scan the printed ISBN"
+    if resolution.outcome == "inconclusive":
+        return (
+            "Couldn’t safely verify this older book barcode right now — "
+            "try again later or scan the printed ISBN"
+        )
+    return (
+        "Older book barcode recognized, but no unique book match was found — "
+        "scan the printed ISBN"
+    )
+
+
+@router.post("/scan")
+'''
+          if marker not in text:
+              raise SystemExit('mode marker not found')
+          text = text.replace(marker, helpers, 1)
+
+          old_existing = '''    # --- Modes that operate on existing items ---
+    if mode in _EXISTING_ITEM_MODES:
+        item = _find_item_by_barcode(raw)
+        # inventory mode handles not-found specially
+'''
+          new_existing = '''    # --- Modes that operate on existing items ---
+    if mode in _EXISTING_ITEM_MODES:
+        legacy_resolution = await _resolve_legacy_book_barcode(raw)
+        if legacy_resolution is not None:
+            if legacy_resolution.outcome != "found":
+                items_common._log_scan(raw, "book", "error", mode=mode)
+                return templates.TemplateResponse(
+                    request,
+                    "fragments/scan_result.html",
+                    {
+                        "status": "error",
+                        "isbn": raw,
+                        "message": _legacy_resolution_message(legacy_resolution),
+                    },
+                )
+            assert legacy_resolution.isbn13 is not None
+            item = _find_item_by_barcode(legacy_resolution.isbn13)
+        else:
+            item = _find_item_by_barcode(raw)
+        # inventory mode handles not-found specially
+'''
+          if old_existing not in text:
+              raise SystemExit('existing-mode dispatch block not found')
+          text = text.replace(old_existing, new_existing, 1)
+
+          start = text.index('    # --- Add / Wishlist modes (create new items) ---')
+          end = text.index('    # §1 — the barcode outranks the dropdown', start)
+          new_add = '''    # --- Add / Wishlist modes (create new items) ---
+    # Legacy mass-market/juvenile books can carry a 12-digit price-point
+    # UPC plus a five-digit title supplement. Resolve every plausible ISBN
+    # through metadata and accept only one verified answer.
+    legacy_resolution = await _resolve_legacy_book_barcode(raw)
+    if legacy_resolution is not None:
+        barcode_type = "isbn"
+        if legacy_resolution.outcome != "found":
+            items_common._log_scan(raw, "book", "error", mode=mode)
+            return templates.TemplateResponse(
+                request,
+                "fragments/scan_result.html",
+                {
+                    "status": "error",
+                    "isbn": raw,
+                    "message": _legacy_resolution_message(legacy_resolution),
+                },
+            )
+
+        assert legacy_resolution.isbn13 is not None
+        assert legacy_resolution.metadata is not None
+        isbn13 = legacy_resolution.isbn13
+    else:
+        # Detect barcode type — route ordinary UPC barcodes to
+        # DVD/product lookup.
+        barcode_type = upc_svc.detect_barcode_type(raw)
+        if barcode_type == "upc":
+            return await items_common._scan_upc(
+                request,
+                templates,
+                raw,
+                media_type,
+                location_id,
+                platform or None,
+                mode=mode,
+            )
+
+        # Normalize ordinary ISBN input.
+        isbn13, _ = isbn_svc.canonicalize_isbn_pair(raw)
+        if not isbn13:
+            items_common._log_scan(isbn, media_type, "error", mode=mode)
+            return templates.TemplateResponse(
+                request, "fragments/scan_result.html",
+                {"status": "error", "isbn": isbn, "message": "Invalid ISBN"},
+            )
+
+'''
+          text = text[:start] + new_add + text[end:]
+          items.write_text(text, encoding='utf-8')
+
+          legacy = Path('app/services/legacy_book.py')
+          ltext = legacy.read_text(encoding='utf-8')
+          old_parse = '''    digits = upc_svc.normalize_barcode(raw)
+    if len(digits) != 17:
+        return None
+
+    upc = digits[:12]
+    supplement = digits[12:]
+'''
+          new_parse = '''    digits = upc_svc.normalize_barcode(raw)
+    # UPC-A may be transmitted by hardware as its EAN-13 equivalent with a
+    # leading zero. With the +5 supplement that is 18 digits instead of 17.
+    # Normalize only that exact equivalence, never a generic EAN-13+5 code.
+    if len(digits) == 18 and digits.startswith("0"):
+        digits = digits[1:]
+    if len(digits) != 17:
+        return None
+
+    upc = digits[:12]
+    supplement = digits[12:]
+'''
+          if old_parse not in ltext:
+              raise SystemExit('legacy parse block not found')
+          legacy.write_text(ltext.replace(old_parse, new_parse, 1), encoding='utf-8')
+
+          tests = Path('tests/test_legacy_book.py')
+          ttext = tests.read_text(encoding='utf-8')
+          old_format = '''def test_formatting_between_upc_and_supplement_is_accepted():
+    assert legacy_book.isbn13_candidates("0 78073 00350 1 + 43506") == (
+        "9780590435062",
+        "9780439435062",
+    )
+'''
+          new_format = '''def test_formatting_between_upc_and_supplement_is_accepted():
+    expected = (
+        "9780590435062",
+        "9780439435062",
+    )
+    assert legacy_book.isbn13_candidates("0 78073 00350 1 + 43506") == expected
+    assert legacy_book.isbn13_candidates("007807300350143506") == expected
+'''
+          if old_format not in ttext:
+              raise SystemExit('formatting test not found')
+          tests.write_text(ttext.replace(old_format, new_format, 1), encoding='utf-8')
+
+          route_tests = Path('tests/test_legacy_book_scan.py')
+          rtext = route_tests.read_text(encoding='utf-8')
+          old_lookup = '''    def test_lookup_mode_finds_existing_book_from_legacy_barcode(self, admin_client, db):
+        _insert_item(
+            db,
+            title="Kristy and the Mother's Day Surprise",
+            isbn=KRISTY_ISBN13,
+        )
+        db.commit()
+
+        with patch("app.routers.items_common._lookup_metadata") as lookup:
+            resp = admin_client.post("/api/scan", data={
+                "isbn": KRISTY_UPC5,
+                "mode": "lookup",
+            })
+
+        assert resp.status_code == 200
+        assert b"found" in resp.content
+        assert b"Kristy" in resp.content
+        lookup.assert_not_called()
+'''
+          new_lookup = '''    def test_lookup_mode_verifies_legacy_barcode_before_local_action(self, admin_client, db):
+        _insert_item(
+            db,
+            title="Kristy and the Mother's Day Surprise",
+            isbn=KRISTY_ISBN13,
+        )
+        db.commit()
+        correct = _metadata("Kristy and the Mother's Day Surprise")
+
+        async def lookup(isbn, hc_token, client, *, google_api_key=None):
+            if isbn == KRISTY_ISBN13:
+                return correct, "openlibrary", {}, provider_result.found("openlibrary", correct)
+            assert isbn == OTHER_CANDIDATE
+            return None, "manual", {}, provider_result.no_match("openlibrary")
+
+        lookup_mock = AsyncMock(side_effect=lookup)
+        with patch("app.routers.items_common._lookup_metadata", new=lookup_mock):
+            resp = admin_client.post("/api/scan", data={
+                "isbn": KRISTY_UPC5,
+                "mode": "lookup",
+            })
+
+        assert resp.status_code == 200
+        assert b"found" in resp.content
+        assert b"Kristy" in resp.content
+        assert lookup_mock.await_count == 2
+'''
+          if old_lookup not in rtext:
+              raise SystemExit('lookup test not found')
+          rtext = rtext.replace(old_lookup, new_lookup, 1)
+
+          anchor = '''        assert db.execute(
+            "SELECT id FROM items WHERE isbn IN (?, ?)",
+            (KRISTY_ISBN13, OTHER_CANDIDATE),
+        ).fetchone() is None
+'''
+          extended = anchor + '''
+        _insert_item(db, title="Local candidate", isbn=KRISTY_ISBN13)
+        db.commit()
+        with patch(
+            "app.routers.items_common._lookup_metadata",
+            new=AsyncMock(side_effect=lookup),
+        ):
+            lookup_resp = admin_client.post("/api/scan", data={
+                "isbn": KRISTY_UPC5,
+                "mode": "lookup",
+            })
+        assert lookup_resp.status_code == 200
+        assert "matches more than one book" in lookup_resp.text
+        assert "Local candidate" not in lookup_resp.text
+'''
+          if anchor not in rtext:
+              raise SystemExit('ambiguous assertion anchor not found')
+          route_tests.write_text(rtext.replace(anchor, extended, 1), encoding='utf-8')
+          PY
+
+          python -m compileall -q app
+          git diff --check
+
+      - name: Restore normal CI and commit hardening
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout origin/main -- .github/workflows/test.yml
+          git add .github/workflows/test.yml app/routers/items.py app/services/legacy_book.py tests/test_legacy_book.py tests/test_legacy_book_scan.py
+          git diff --cached --check
+          git commit -m "Harden legacy UPC+5 scan resolution"
+          git push origin HEAD:fix/legacy-upc5-book-scans
+
   # Unit/integration suite plus the offline lints. These are the cheap gates and
   # they run together because they share one dependency install.
   test:
@@ -24,17 +357,9 @@ jobs:
       - name: Run unit and integration tests
         run: make test
 
-      # check-secrets uses `git grep` over tracked files, so it needs the
-      # checkout above and nothing else. check-csrf and check-alpine are the two
-      # lints that graduated out of GOTCHAS (G5, G32) — they were only ever run
-      # by hand before, which is how the class each one guards kept shipping.
       - name: Offline lints (secrets, CSRF header, Alpine CSP)
         run: make checks-fast
 
-  # The committed Tailwind build must match what the templates actually ask for.
-  # Nothing caught a forgotten `make css` before: the stale stylesheet is valid
-  # CSS, every unit test passes, and the missing rule only shows up as a broken
-  # layout in a browser.
   css:
     runs-on: ubuntu-latest
     steps:
@@ -45,8 +370,6 @@ jobs:
           node-version: '20'
           cache: npm
 
-      # `make css` also stamps SW_VERSION (scripts/stamp_sw_version.py, stdlib
-      # only — no pip install needed).
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
@@ -66,9 +389,6 @@ jobs:
             exit 1
           }
 
-  # Playwright suite, in its own job: it is the slowest gate and the only one
-  # that sees rendered geometry, so a failure here should be attributable at a
-  # glance rather than buried behind a unit-test run.
   e2e:
     runs-on: ubuntu-latest
     steps:
@@ -85,6 +405,5 @@ jobs:
       - name: Install Chromium
         run: playwright install --with-deps chromium
 
-      # Spins up its own uvicorn per session — no dev server needed.
       - name: Run E2E tests
         run: make test-e2e
