@@ -20,7 +20,7 @@ from app.routers.series import MAX_SERIES_NAME
 from app.routers import items_common
 from app.routers.items_common import SORT_OPTIONS  # re-exported for pages.py
 from app.services import isbn as isbn_svc
-from app.services.item_write import insert_item
+from app.services.item_write import canonicalize_isbn_fields, insert_item
 from app.services import openlibrary, googlebooks, hardcover, covers, national
 from app.services import detect
 from app.services import cover_queue
@@ -332,7 +332,7 @@ async def scan_isbn(
         return await items_common._scan_upc(request, templates, raw, media_type, location_id, platform or None, mode=mode)
 
     # Normalize ISBN
-    isbn13 = isbn_svc.to_isbn13(raw)
+    isbn13, _ = isbn_svc.canonicalize_isbn_pair(raw)
     if not isbn13:
         items_common._log_scan(isbn, media_type, "error", mode=mode)
         return templates.TemplateResponse(
@@ -504,8 +504,12 @@ async def manual_add(request: Request, _=Depends(require_role("editor"))):
         isbn13 = isbn10 = None
     else:
         upc_code = None
-        isbn13 = isbn_svc.to_isbn13(isbn) if isbn else None
-        isbn10 = isbn_svc.isbn13_to_isbn10(isbn13) if isbn13 else None
+        isbn13, isbn10 = isbn_svc.canonicalize_isbn_pair(isbn)
+        if isbn and not isbn13:
+            return templates.TemplateResponse(
+                request, "fragments/scan_result.html",
+                {"status": "error", "isbn": isbn, "message": "Invalid ISBN"},
+            )
     pub_year = form.get("publish_year")
     platform = form.get("platform") or None
     language = form.get("language", "").strip() or None
@@ -806,7 +810,8 @@ async def merge_items(request: Request, _=Depends(require_role("admin"))):
             return {"ok": False, "message": "Primary item not found"}
 
         _MERGE_FILLABLE = frozenset(["subtitle", "authors", "publisher", "publish_year", "page_count",
-                                      "description", "series_name", "narrator", "isbn"])
+                                      "description", "series_name", "narrator"])
+        primary_isbn = primary["isbn"]
         for mid in merge_ids:
             other = db.execute("SELECT * FROM items WHERE id = ?", (mid,)).fetchone()
             if not other:
@@ -814,6 +819,16 @@ async def merge_items(request: Request, _=Depends(require_role("admin"))):
             for field in _MERGE_FILLABLE:
                 if not primary[field] and other[field]:
                     db.execute(f"UPDATE items SET {field} = ? WHERE id = ?", (other[field], keep_id))
+
+            if not primary_isbn and (other["isbn"] or other["isbn10"]):
+                isbn_fields = canonicalize_isbn_fields(
+                    {"isbn": other["isbn"], "isbn10": other["isbn10"]}
+                )
+                db.execute(
+                    "UPDATE items SET isbn = ?, isbn10 = ? WHERE id = ?",
+                    (isbn_fields["isbn"], isbn_fields["isbn10"], keep_id),
+                )
+                primary_isbn = isbn_fields["isbn"]
 
             db.execute("UPDATE scan_log SET item_id = ? WHERE item_id = ?", (keep_id, mid))
             db.execute("UPDATE reading_log SET item_id = ? WHERE item_id = ?", (keep_id, mid))
@@ -845,6 +860,13 @@ async def update_item(request: Request, item_id: int, _=Depends(require_role("ed
                 fields[key] = int(val) if val else 0
             else:
                 fields[key] = val
+
+    if "isbn" in fields:
+        submitted_isbn = fields["isbn"]
+        isbn_fields = canonicalize_isbn_fields({"isbn": submitted_isbn})
+        if submitted_isbn and not isbn_fields["isbn"]:
+            return HTMLResponse("Invalid ISBN", status_code=400)
+        fields.update(isbn_fields)
 
     # Handle cover upload
     cover_file = form.get("cover")
@@ -1204,7 +1226,6 @@ async def test_igdb_key(request: Request, _=Depends(require_role("admin"))):
         return {"ok": False, "message": "Both Client ID and Client Secret are required"}
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         return await igdb.test_credentials(client_id, client_secret, client)
-
 
 
 

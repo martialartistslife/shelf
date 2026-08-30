@@ -109,7 +109,7 @@ async def store_queue(request: Request, _=Depends(require_role("editor"))):
     results = []
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         for raw in isbns:
-            isbn13 = isbn_svc.to_isbn13(raw)
+            isbn13, _ = isbn_svc.canonicalize_isbn_pair(raw)
             if not isbn13:
                 results.append({"isbn": raw, "status": "invalid"})
                 continue

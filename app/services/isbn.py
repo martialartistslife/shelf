@@ -53,6 +53,35 @@ def validate_isbn13(s: str) -> bool:
     return total % 10 == 0
 
 
+def canonicalize_isbn_pair(
+    isbn: str | None, isbn10: str | None = None
+) -> tuple[str | None, str | None]:
+    """Return the canonical ``(isbn13, isbn10)`` pair for stored identifiers.
+
+    ``to_isbn13`` deliberately remains permissive because barcode detection
+    callers use its UPC-A to EAN-13 conversion.  Persistence paths need a
+    stricter contract: only checksum-valid ISBNs may reach ``items.isbn`` and
+    ``items.isbn10``, and the companion value is always derived rather than
+    trusted from a caller.
+
+    The primary ``isbn`` value wins when both fields are supplied.  An
+    ``isbn10`` fallback is considered only when the primary value is empty;
+    this prevents a stale companion from overriding an invalid or changed
+    primary identifier.
+    """
+    candidate = isbn if isinstance(isbn, str) and isbn.strip() else isbn10
+    if not isinstance(candidate, str) or not candidate.strip():
+        return None, None
+
+    normalized = normalize_isbn(candidate)
+    if validate_isbn10(normalized):
+        canonical13 = isbn10_to_isbn13(normalized)
+        return canonical13, normalized
+    if validate_isbn13(normalized):
+        return normalized, isbn13_to_isbn10(normalized)
+    return None, None
+
+
 def isbn13_to_isbn10(isbn13: str) -> str | None:
     if len(isbn13) != 13 or not isbn13.startswith("978"):
         return None

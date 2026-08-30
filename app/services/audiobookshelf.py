@@ -5,7 +5,7 @@ import httpx
 
 from app.database import get_db
 from app.services import covers
-from app.services.item_write import insert_item
+from app.services.item_write import canonicalize_isbn_fields, insert_item
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +107,9 @@ async def sync(abs_url: str, abs_token: str, on_progress=None) -> dict:
                 authors = metadata.get("authorName") or metadata.get("author")
                 narrator = metadata.get("narratorName")
                 isbn = metadata.get("isbn") or metadata.get("asin")
+                isbn_fields = canonicalize_isbn_fields({"isbn": isbn})
+                isbn = isbn_fields["isbn"]
+                isbn10 = isbn_fields["isbn10"]
                 series_name = metadata.get("seriesName")
                 publisher = metadata.get("publisher")
                 pub_year = metadata.get("publishedYear")
@@ -123,12 +126,12 @@ async def sync(abs_url: str, abs_token: str, on_progress=None) -> dict:
                     if existing:
                         db.execute(
                             """UPDATE items SET title=?, authors=?, narrator=?,
-                               isbn=?, series_name=?, publisher=?, publish_year=?,
+                               isbn=?, isbn10=?, series_name=?, publisher=?, publish_year=?,
                                description=?, duration_mins=?, media_type=?,
                                abs_library_id=?,
                                updated_at=datetime('now')
                                WHERE abs_id=?""",
-                            (title, authors, narrator, isbn, series_name,
+                            (title, authors, narrator, isbn, isbn10, series_name,
                              publisher, pub_year, description, duration_mins,
                              media_type, lib_id, abs_id),
                         )
@@ -142,6 +145,7 @@ async def sync(abs_url: str, abs_token: str, on_progress=None) -> dict:
                             title=title,
                             authors=authors,
                             isbn=isbn,
+                            isbn10=isbn10,
                             media_type=media_type,
                             publisher=publisher,
                             publish_year=pub_year,

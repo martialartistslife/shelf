@@ -319,8 +319,10 @@ async def resolve_missing_cover(
         found_isbn, cover_url = await _search_isbn_for_item(
             row["title"], row["authors"], client)
         if found_isbn and not row["isbn"]:
-            isbn13 = isbn_svc.to_isbn13(found_isbn) or found_isbn
-            isbn10 = isbn_svc.isbn13_to_isbn10(isbn13) if len(isbn13) == 13 else None
+            isbn13, isbn10 = isbn_svc.canonicalize_isbn_pair(found_isbn)
+            if not isbn13:
+                found_isbn = None
+        if found_isbn and not row["isbn"]:
             with get_db() as db:
                 taken = db.execute(
                     "SELECT id FROM items WHERE isbn = ? AND id != ?",

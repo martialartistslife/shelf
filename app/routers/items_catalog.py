@@ -221,7 +221,7 @@ async def add_book_from_search(
             {"status": "error", "isbn": isbn.strip(),
              "message": "Unrecognised media type — pick one and try again"},
         )
-    isbn13 = isbn_svc.to_isbn13(isbn.strip())
+    isbn13, _ = isbn_svc.canonicalize_isbn_pair(isbn.strip())
     if not isbn13:
         return templates.TemplateResponse(
             request, "fragments/scan_result.html",
