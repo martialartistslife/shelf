@@ -137,6 +137,14 @@ MIGRATIONS: Sequence[tuple[int, str, str]] = (
             ELSE NULL
         END
         WHERE language IS NULL AND isbn IS NOT NULL"""),
+    (24, "Add confirmed legacy book barcode mappings",
+     """CREATE TABLE IF NOT EXISTS legacy_book_mappings (
+            barcode      TEXT PRIMARY KEY,
+            isbn13       TEXT NOT NULL,
+            confirmed_at TEXT NOT NULL DEFAULT (datetime('now')),
+            CHECK(length(barcode) = 17),
+            CHECK(length(isbn13) = 13)
+        )"""),
 )
 
 MIGRATION_TABLES = """
