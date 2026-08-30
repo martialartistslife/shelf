@@ -1,0 +1,40 @@
+name: PR9 generated output
+
+on:
+  push:
+    branches:
+      - fix/legacy-barcode-mappings
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: fix/legacy-barcode-mappings
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '20'
+          cache: npm
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.13'
+      - name: Rebuild committed output and remove this one-shot workflow
+        run: |
+          npm ci
+          make css
+          git rm .github/workflows/pr9-generated-output.yml
+          git add static/css/app.css static/sw.js
+          git diff --cached --check
+      - name: Commit generated output
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Refresh generated scan assets"
+          git push origin HEAD:fix/legacy-barcode-mappings
