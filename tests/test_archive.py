@@ -57,6 +57,7 @@ def _seed_full_library(db):
         subtitle="",
         authors="Frank Herbert",
         isbn="9780441013593",
+        isbn10="0441013597",
         media_type="book",
         publisher="Ace",
         series_name="Dune Saga",
