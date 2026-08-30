@@ -24,6 +24,7 @@ def test_real_scholastic_upc5_generates_expected_isbn_candidate():
     assert parsed is not None
     assert parsed.upc == "078073003501"
     assert parsed.supplement == "43506"
+    assert parsed.isbn10_prefixes == ("0590", "0439")
     assert legacy_book.isbn13_candidates(KRISTY_UPC5) == (
         "9780590435062",
         "9780439435062",
